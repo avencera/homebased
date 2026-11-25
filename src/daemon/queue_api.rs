@@ -439,6 +439,18 @@ pub(super) async fn send_job(state: &AppState, route: JobRoute) -> Result<Value,
             Ok(value)
         }
         Err(error) => {
+            // a machine that closed the class after placement read its offer,
+            // as an idle temporary machine does before it releases itself,
+            // leaves the job to another machine
+            if error.code() == "class_not_offered" {
+                let job = route.job;
+                let held =
+                    call(&state.store, |reply| StoreMsg::UnplaceCiJob { job, reply }).await?;
+                if held {
+                    tracing::info!(%job, machine = %route.authority, "CI job held again: its machine closed the class");
+                    return Err(error);
+                }
+            }
             if matches!(route.submission, JobSubmission::Unknown) && definite_refusal(&error) {
                 let refusal = JobRefusal {
                     code: error.code().to_owned(),
@@ -873,6 +885,24 @@ async fn cluster_request(
 async fn cluster_event(
     State(state): State<AppState>,
     QueueJson(body): QueueJson<ClusterJobEvent>,
+) -> Result<Json<Value>, AppError> {
+    accept_job_event(&state, body).await
+}
+
+/// `POST /v1/cluster/job-events` over the Fleet link: only for jobs the
+/// temporary machine on the other end stores
+pub(super) async fn member_job_event(
+    State(state): State<AppState>,
+    axum::Extension(peer): axum::Extension<super::fleet_link::LinkPeer>,
+    QueueJson(body): QueueJson<ClusterJobEvent>,
+) -> Result<Json<Value>, AppError> {
+    peer.require_member(body.event.authority)?;
+    accept_job_event(&state, body).await
+}
+
+async fn accept_job_event(
+    state: &AppState,
+    body: ClusterJobEvent,
 ) -> Result<Json<Value>, AppError> {
     state
         .machine

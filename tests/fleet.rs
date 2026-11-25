@@ -532,6 +532,8 @@ mod ci_queue;
 mod dependencies;
 #[path = "fleet/events.rs"]
 mod events;
+#[path = "support/fake_cloudlease.rs"]
+mod fake_cloudlease;
 #[path = "support/fake_t3.rs"]
 mod fake_t3;
 #[path = "fleet/inspection.rs"]
@@ -542,6 +544,8 @@ mod machine_wait;
 mod messages;
 #[path = "fleet/peers.rs"]
 mod peers;
+#[path = "fleet/pools.rs"]
+mod pools;
 #[path = "fleet/resource_jobs.rs"]
 mod resource_jobs;
 #[path = "fleet/submission.rs"]

@@ -48,6 +48,7 @@ impl Observer {
                     tailscale: None,
                 },
                 machines: configured,
+                iroh: None,
             },
             listener: None,
             peers_path: dir.path().join("fleet-peers.json"),

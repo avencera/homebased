@@ -66,6 +66,7 @@ fn event(route: &JobRoute, seq: u64) -> RoutedJobEvent {
             gpu_summaries: Vec::new(),
             lease_idle: None,
             timeout: None,
+            machine_released: None,
         },
     }
 }
@@ -359,4 +360,47 @@ fn a_route_saved_before_gpu_idle_keeps_its_digest() {
     );
     let saved: serde_json::Value = serde_json::from_str(ROUTE_BEFORE_GPU_IDLE).unwrap();
     assert_eq!(serde_json::to_value(&route.spec).unwrap(), saved["spec"]);
+}
+
+#[test]
+fn a_pool_ends_only_jobs_it_still_holds_and_a_closed_class_holds_a_job_again() {
+    let dir = tempdir().unwrap();
+    let store = Store::open(&dir.path().join("homebased.db")).unwrap();
+    let mut held = route();
+    held.spec = JobSpec::parse_value(&serde_json::json!({
+        "api_version": 1, "thread": "77777777-7777-4777-8777-777777777777",
+        "name": "ci test", "cwd": "/tmp", "priority": "low", "preempt": { "mode": "wait" },
+        "workload": { "type": "task", "command": ["/bin/true"] },
+        "ci": { "class": "afv", "kill_after": "10m" }
+    }))
+    .unwrap();
+    held.digest = held.spec.digest().unwrap();
+    held.submission = JobSubmission::Held;
+    held.authority = held.origin;
+    held.owes_final_event = true;
+    let held = store.insert_job_route(&held).unwrap();
+    let ending = || HeldJobEnding::Refused {
+        code: "run_ended".into(),
+        message: "the run takes no machines".into(),
+    };
+
+    // placement sent it to a machine: that machine runs or refuses it
+    let machine = MachineId::new();
+    let placed = store.place_held_job(held.job, machine).unwrap().unwrap();
+    assert_eq!(placed.submission, JobSubmission::Unknown);
+    assert!(!store.end_pool_job(held.job, ending()).unwrap());
+
+    // the machine closed the class before the job reached it: held again,
+    // for any machine, and the pool may end it
+    assert!(store.unplace_ci_job(held.job).unwrap());
+    let again = store.job_route(held.job).unwrap().unwrap();
+    assert_eq!(again.submission, JobSubmission::Held);
+    assert_eq!(again.authority, held.origin);
+    assert!(store.end_pool_job(held.job, ending()).unwrap());
+    let ended = store.job_route(held.job).unwrap().unwrap();
+    assert!(
+        matches!(&ended.submission, JobSubmission::Ended { ending: HeldJobEnding::Refused { code, .. } } if code == "run_ended"),
+        "{:?}",
+        ended.submission
+    );
 }

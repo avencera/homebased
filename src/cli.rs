@@ -7,6 +7,7 @@ pub mod fleet;
 pub mod gc;
 pub mod message;
 pub mod notify;
+pub mod pool;
 pub mod resource;
 pub mod service;
 pub mod t3;
@@ -80,6 +81,12 @@ pub enum Command {
         /// Config subcommand
         #[command(subcommand)]
         command: config::ConfigCommand,
+    },
+    /// Pools of temporary machines that cloudlease creates as CI jobs need them
+    Pool {
+        /// Pool subcommand
+        #[command(subcommand)]
+        command: pool::PoolCommand,
     },
     /// Discover and manage fleet machines
     Fleet {
@@ -367,6 +374,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, AppError> {
         Command::Daemon { command } => daemon::run(&ctx, command).await,
         Command::Config { command } => config::run(&ctx, command),
         Command::Fleet { command } => fleet::run(&ctx, command).await,
+        Command::Pool { command } => pool::run(&ctx, command).await,
         Command::Message { command } => message::run(&ctx, command).await,
         Command::Notify { command } => notify::run(&ctx, command).await,
         Command::Task { command } => task::run(&ctx, command).await,

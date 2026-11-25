@@ -1192,3 +1192,65 @@ fn cancel_race_reports_cancelled_queued() {
         "a row that reached Running must be signalled, not reported cancelled: {result:?}"
     );
 }
+
+#[test]
+fn a_pool_release_keeps_its_run_and_survives_a_stale_save() {
+    use crate::pool::{Pool, PoolEnd, PoolSettings, PoolState};
+    use crate::queue::ci::SlotCapacity;
+
+    let directory = tempdir().unwrap();
+    let store = Store::open(&directory.path().join("state.sqlite")).unwrap();
+    let now = chrono::Utc::now();
+    let open = Pool {
+        name: "afv".parse().unwrap(),
+        settings: PoolSettings {
+            machine_class: "do-c16".parse().unwrap(),
+            max_machines: 4,
+            deadline_at: now + chrono::Duration::hours(1),
+            slots: SlotCapacity::default(),
+            idle_limit: Duration::from_secs(600),
+            stall_after: Duration::from_secs(1800),
+            boot_timeout: Some(Duration::from_secs(900)),
+            min_free_disk_gib: 1,
+            env_file: None,
+            spend_cap_cents: None,
+        },
+        run_request: uuid::Uuid::now_v7(),
+        run: None,
+        state: PoolState::Open,
+        created_at: now,
+        last_error: None,
+        create_failures: None,
+    };
+    store.insert_pool(&open).unwrap();
+
+    // a reconcile pass saves the run it created; `pool release` then changes
+    // only the state, so the run stays known
+    let with_run = Pool {
+        run: Some(crate::pool::RunId::new("run-1")),
+        ..open.clone()
+    };
+    store.update_pool(&with_run).unwrap();
+    let released = store
+        .release_pool(&open.name, PoolEnd::Requested)
+        .unwrap()
+        .unwrap();
+    assert_eq!(released.run, with_run.run);
+
+    // a pass that read the pool before the release saves its copy after it
+    let pass = Pool {
+        last_error: Some("cloudlease timed out".into()),
+        ..with_run
+    };
+    store.update_pool(&pass).unwrap();
+
+    let stored = store.pool(&pass.name).unwrap().unwrap();
+    assert_eq!(
+        stored.state,
+        PoolState::Releasing {
+            end: PoolEnd::Requested
+        }
+    );
+    assert_eq!(stored.run, pass.run);
+    assert_eq!(stored.last_error.as_deref(), Some("cloudlease timed out"));
+}

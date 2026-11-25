@@ -160,6 +160,17 @@ pub(crate) enum StoreMsg {
         authority: MachineId,
         reply: RpcReplyPort<Result<Option<crate::queue::delivery::JobRoute>, AppError>>,
     },
+    /// End a CI job its pool still holds, as the pool ends
+    EndPoolJob {
+        job: crate::queue::JobId,
+        ending: crate::queue::delivery::HeldJobEnding,
+        reply: RpcReplyPort<Result<bool, AppError>>,
+    },
+    /// Hold a placed CI job for placement again
+    UnplaceCiJob {
+        job: crate::queue::JobId,
+        reply: RpcReplyPort<Result<bool, AppError>>,
+    },
     /// Change a held CI job's machine choice or level
     MoveHeldCiJob {
         job: crate::queue::JobId,
@@ -623,6 +634,67 @@ pub(crate) enum StoreMsg {
         id: crate::thread_watch::WatchId,
         reply: RpcReplyPort<Result<Vec<crate::thread_watch::WatchEvent>, AppError>>,
     },
+    /// Save a new pool
+    InsertPool {
+        pool: Box<crate::pool::Pool>,
+        reply: RpcReplyPort<Result<crate::store::PoolInsert, AppError>>,
+    },
+    /// Read one pool
+    Pool {
+        name: crate::pool::PoolName,
+        reply: RpcReplyPort<Result<Option<crate::pool::Pool>, AppError>>,
+    },
+    /// Read every pool
+    Pools {
+        reply: RpcReplyPort<Result<Vec<crate::pool::Pool>, AppError>>,
+    },
+    /// Replace a pool's record
+    UpdatePool {
+        pool: Box<crate::pool::Pool>,
+        reply: RpcReplyPort<Result<(), AppError>>,
+    },
+    /// Read every machine of a pool
+    PoolMachines {
+        pool: crate::pool::PoolName,
+        reply: RpcReplyPort<Result<Vec<crate::pool::PoolMachine>, AppError>>,
+    },
+    /// Read one pool machine
+    PoolMachine {
+        slot: crate::pool::SlotId,
+        reply: RpcReplyPort<Result<Option<crate::pool::PoolMachine>, AppError>>,
+    },
+    /// Save a machine before its create call
+    InsertPoolMachine {
+        machine: Box<crate::pool::PoolMachine>,
+        boot: Box<crate::pool::boot::BootPayload>,
+        reply: RpcReplyPort<Result<(), AppError>>,
+    },
+    /// Read the create body of a machine cloudlease has not answered for
+    PendingBoot {
+        slot: crate::pool::SlotId,
+        reply: RpcReplyPort<Result<Option<crate::pool::boot::BootPayload>, AppError>>,
+    },
+    /// Move an open pool to releasing
+    ReleasePool {
+        name: crate::pool::PoolName,
+        end: crate::pool::PoolEnd,
+        reply: RpcReplyPort<Result<Option<crate::pool::Pool>, AppError>>,
+    },
+    /// Replace a machine's record
+    UpdatePoolMachine {
+        machine: Box<crate::pool::PoolMachine>,
+        reply: RpcReplyPort<Result<(), AppError>>,
+    },
+    /// What runs or waits on this temporary machine
+    TemporaryActivity {
+        reply: RpcReplyPort<Result<crate::store::StoredActivity, AppError>>,
+    },
+    /// End the unfinished jobs this origin sent to a machine cloudlease deleted
+    EndJobsOfReleasedMachine {
+        machine: MachineId,
+        released: Box<crate::pool::MachineReleased>,
+        reply: RpcReplyPort<Result<Vec<crate::queue::JobId>, AppError>>,
+    },
     /// Save a new service
     InsertService {
         service: Box<crate::service::Service>,
@@ -1060,6 +1132,10 @@ impl Actor for StoreActor {
                 authority,
                 reply,
             } => send_reply(reply, state.place_held_job(job, authority)),
+            StoreMsg::UnplaceCiJob { job, reply } => send_reply(reply, state.unplace_ci_job(job)),
+            StoreMsg::EndPoolJob { job, ending, reply } => {
+                send_reply(reply, state.end_pool_job(job, ending));
+            }
             StoreMsg::MoveHeldCiJob {
                 job,
                 machine,
@@ -1436,6 +1512,37 @@ impl Actor for StoreActor {
             StoreMsg::SettledWatchEvents { id, reply } => {
                 send_reply(reply, state.settled_watch_events(id));
             }
+            StoreMsg::InsertPool { pool, reply } => send_reply(reply, state.insert_pool(&pool)),
+            StoreMsg::Pool { name, reply } => send_reply(reply, state.pool(&name)),
+            StoreMsg::Pools { reply } => send_reply(reply, state.pools()),
+            StoreMsg::UpdatePool { pool, reply } => send_reply(reply, state.update_pool(&pool)),
+            StoreMsg::PoolMachines { pool, reply } => {
+                send_reply(reply, state.pool_machines(&pool));
+            }
+            StoreMsg::PoolMachine { slot, reply } => send_reply(reply, state.pool_machine(slot)),
+            StoreMsg::InsertPoolMachine {
+                machine,
+                boot,
+                reply,
+            } => {
+                send_reply(reply, state.insert_pool_machine(&machine, &boot));
+            }
+            StoreMsg::PendingBoot { slot, reply } => send_reply(reply, state.pending_boot(slot)),
+            StoreMsg::ReleasePool { name, end, reply } => {
+                send_reply(reply, state.release_pool(&name, end));
+            }
+            StoreMsg::UpdatePoolMachine { machine, reply } => {
+                send_reply(reply, state.update_pool_machine(&machine));
+            }
+            StoreMsg::TemporaryActivity { reply } => send_reply(reply, state.temporary_activity()),
+            StoreMsg::EndJobsOfReleasedMachine {
+                machine,
+                released,
+                reply,
+            } => send_reply(
+                reply,
+                state.end_jobs_of_released_machine(machine, &released),
+            ),
             StoreMsg::InsertService { service, reply } => {
                 send_reply(reply, state.insert_service(&service));
             }

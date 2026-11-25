@@ -131,3 +131,16 @@ Claude Code delivery uses an internal Claude Code socket protocol, not a public 
 | `internal` | 1 | Keep the error and state evidence. Ask the operator to check it. Do not edit the database. |
 
 See [resource-queue.md](resource-queue.md) for job and operation retry identities. A run task in `after` returns `usage` (exit 2). Put the run's job in `after` instead.
+
+## Pool errors
+
+| Code | Exit | Do this |
+| --- | --- | --- |
+| `pools_not_configured` | 2 | Run `pool` commands on the coordinator, the machine with a `[pools]` config. Do not add one without the user. |
+| `pool_deadline_too_close` | 2 | No machine of the pool, counting a new machine's boot, could run the job to its `--kill-after`. Lower `--kill-after` to at most the longest the message names, or ask the user for a new pool with a later `--deadline`. A waiting job that falls out of reach later ends with `JOB_FAILED` carrying this code. |
+| `pool_not_found` | 3 | Read `homebased --json pool list` on the coordinator. |
+| `pool_exists` | 5 | Use the open pool, or release it first when its settings are wrong. |
+| `pool_ended` | 5 | The pool is stopped, releasing, or released; the message has cloudlease's code when it stopped. Create a new one only with the user's approval. |
+| `join_refused` | 5 | A machine's join did not match a machine the coordinator asked for. Agents never see it; the machine retries and cloudlease deletes it at its boot deadline. |
+
+A pool that cloudlease refuses a machine, for example with `run_ended` or `spend_cap_reached`, or whose machines the provider failed to create 3 times in a row (`create_failed`), stops: it fails its waiting jobs with `JOB_FAILED` whose `held_ending` carries that code, and lets running jobs finish. A pool whose run cloudlease lost (`run_not_found`) or ended without the coordinator asking (`run_ended`, such as at its spend cap) is released, and its waiting jobs fail with that code. See [pools.md](pools.md).

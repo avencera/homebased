@@ -17,6 +17,7 @@ pub mod directory;
 pub mod discovery;
 pub mod http;
 pub mod identity;
+pub mod iroh;
 pub mod probe;
 pub mod protocol;
 pub mod runtime;

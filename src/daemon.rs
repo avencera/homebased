@@ -15,6 +15,7 @@ pub mod context_threads;
 mod dependencies;
 pub mod event_sender;
 pub mod fleet_api;
+pub mod fleet_link;
 pub mod fleet_queues;
 pub mod fleet_tasks;
 pub mod fleet_view;
@@ -28,11 +29,13 @@ pub(crate) mod message_receiver;
 pub(crate) mod message_sender;
 mod origin_submit;
 mod peer_read;
+pub mod pools;
 pub mod queue_api;
 pub(crate) mod retention;
 mod service_api;
 pub mod t3_launch;
 mod t3_watch;
+mod temporary;
 pub mod thread_api;
 mod thread_control;
 mod thread_detach;
@@ -115,6 +118,12 @@ pub struct AppState {
     pub(crate) memory_limits: actors::memory::MemoryLimits,
     /// Retention settings and the lock that runs one pass at a time
     pub(crate) retention: retention::Retention,
+    /// How this daemon reaches cloudlease, when it coordinates pools
+    pub pools: Option<crate::config::PoolsConfig>,
+    /// This daemon's end of the Fleet link, when `[fleet.iroh]` is set
+    pub(crate) fleet_link: Option<fleet_link::FleetLink>,
+    /// This machine's lease, when it is a temporary machine
+    pub(crate) temporary: temporary::Member,
 }
 
 /// Per-key locks this daemon holds while it resolves or sends one saved route
@@ -130,6 +139,8 @@ pub(crate) struct DaemonLocks {
     pub(crate) origin_submissions: KeyedLocks<RequestId>,
     /// Origin-side cancellation intents, by task
     pub(crate) cancellation_intents: KeyedLocks<TaskId>,
+    /// Joins of temporary machines, by pool slot
+    pub(crate) pool_joins: KeyedLocks<crate::pool::SlotId>,
 }
 
 /// Hold `daemon.lock`, bind the socket and optional dashboard port, start
@@ -184,6 +195,16 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
     let waiters = call(&supervisor, |reply| SupervisorMsg::GetWaiters { reply }).await?;
     let memory = call(&supervisor, |reply| SupervisorMsg::GetMemory { reply }).await?;
     let fleet_runtime = start_fleet(&home, &config, &machine, web_addr);
+    let iroh = config
+        .fleet_settings()
+        .and_then(|settings| settings.iroh.as_ref());
+    let link = match iroh {
+        // only a pool coordinator lets ids with no grant enroll
+        Some(iroh) => {
+            Some(fleet_link::FleetLink::start(&home, iroh, config.pools.is_some()).await?)
+        }
+        None => None,
+    };
     let fleet = fleet_runtime
         .as_ref()
         .map_or(FleetState::Disabled, |runtime| {
@@ -212,6 +233,9 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
         memory,
         memory_limits,
         retention,
+        pools: config.pools.clone(),
+        fleet_link: link.clone(),
+        temporary: temporary::Member::new(config.temporary.is_some()),
     };
     let sender = tokio::spawn(event_sender::run(
         state.store.clone(),
@@ -242,6 +266,14 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
     ));
     let hold_sweep = tokio::spawn(end_leftover_holds());
     let retention_timer = tokio::spawn(retention::run(state.clone(), retention_requests));
+    let pool_reconciler = tokio::spawn(pools::run(state.clone()));
+    let link_server = link
+        .clone()
+        .map(|link| tokio::spawn(fleet_link::serve(state.clone(), link)));
+    let temporary_member = config
+        .temporary
+        .clone()
+        .map(|temporary| tokio::spawn(temporary::run(state.clone(), temporary)));
     // a blocking task cannot be aborted, so shutdown sets this flag instead
     let usage_backfill_stop = Arc::new(AtomicBool::new(false));
     tokio::task::spawn_blocking({
@@ -302,6 +334,16 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
     lease_guard.abort();
     hold_sweep.abort();
     retention_timer.abort();
+    pool_reconciler.abort();
+    if let Some(server) = link_server {
+        server.abort();
+    }
+    if let Some(link) = &link {
+        link.close().await;
+    }
+    if let Some(member) = temporary_member {
+        member.abort();
+    }
     usage_backfill_stop.store(true, Ordering::Relaxed);
     if !supervisor_died {
         supervisor.stop(None);

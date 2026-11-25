@@ -467,6 +467,9 @@ async fn run_child(
         .env("HOME", &row.env.home);
     // before Homebased's own variables, so an `.envrc` cannot replace them
     envrc.apply(cmd.as_std_mut());
+    // a temporary machine's pool variables, such as an upload token, which
+    // its coordinator handed over at join instead of the boot data
+    cmd.envs(pool_variables(home)?);
     cmd.env(run_env::TASK_ID, id.to_string())
         .env("HOMEBASED_HOME", home.root())
         .stdout(Stdio::from(stdout))
@@ -1041,6 +1044,18 @@ impl ChildOomScore {
             libc::close(fd);
         }
     }
+}
+
+/// Variables a temporary machine's coordinator handed it at join; none elsewhere
+fn pool_variables(home: &Home) -> Result<Vec<(String, String)>, AppError> {
+    let text = match std::fs::read_to_string(home.pool_env_path()) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    crate::pool::parse_env_file(&text).map_err(|message| AppError::Internal {
+        message: format!("pool variables: {message}"),
+    })
 }
 
 #[cfg(test)]

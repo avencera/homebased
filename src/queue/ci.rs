@@ -852,6 +852,10 @@ pub struct MachineOffer {
     pub gauge: Gauge,
     /// Each class it offers, by name
     pub classes: Vec<ClassOffer>,
+    /// When cloudlease deletes it, for a temporary machine; placement sends
+    /// it no job whose kill limit runs past this
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ends_at: Option<DateTime<Utc>>,
 }
 
 impl MachineOffer {
@@ -875,6 +879,9 @@ pub struct PendingJob {
     pub choice: MachineChoice,
     /// When it was submitted; older jobs of a level are placed first
     pub submitted_at: DateTime<Utc>,
+    /// When its run would end at the latest if it started now: now plus its
+    /// kill limit
+    pub must_end_by: DateTime<Utc>,
 }
 
 /// Send `job` to `machine` now
@@ -910,6 +917,8 @@ pub fn place(pending: &[PendingJob], offers: &[MachineOffer]) -> Vec<Assignment>
         let best = offers
             .iter()
             .filter(|offer| offer.admission.is_open() && job.choice.allows(offer.machine))
+            // a temporary machine deleted mid-run would lose the run's output
+            .filter(|offer| offer.ends_at.is_none_or(|end| job.must_end_by <= end))
             .filter_map(|offer| {
                 let class = offer.class(&job.class)?;
                 let used = taken
@@ -1146,17 +1155,37 @@ mod tests {
                     queued: 0,
                 })
                 .collect(),
+            ends_at: None,
         }
     }
 
     fn pending(n: u128, class: &str, priority: Priority, choice: MachineChoice) -> PendingJob {
+        let submitted_at = DateTime::from_timestamp(i64::try_from(n).unwrap(), 0).unwrap();
         PendingJob {
             job: JobId::from_uuid(uuid::Uuid::from_u128(n)),
             class: JobClass::parse(class).unwrap(),
             priority,
             choice,
-            submitted_at: DateTime::from_timestamp(i64::try_from(n).unwrap(), 0).unwrap(),
+            submitted_at,
+            must_end_by: submitted_at + chrono::Duration::hours(1),
         }
+    }
+
+    #[test]
+    fn placement_keeps_jobs_off_temporary_machines_that_end_before_their_kill_limit() {
+        let ending = machine(1);
+        let lasting = machine(2);
+        let job = pending(10, "afv", Priority::Medium, MachineChoice::Any);
+        let mut short = offer(ending, 0.0, &[("afv", 1, 0)]);
+        short.ends_at = Some(job.must_end_by - chrono::Duration::seconds(1));
+        let mut long = offer(lasting, 5.0, &[("afv", 1, 0)]);
+        long.ends_at = Some(job.must_end_by);
+        let placed = place(std::slice::from_ref(&job), &[short.clone(), long]);
+        assert_eq!(
+            placed.iter().map(|a| a.machine).collect::<Vec<_>>(),
+            [lasting]
+        );
+        assert!(place(&[job], &[short]).is_empty());
     }
 
     #[test]

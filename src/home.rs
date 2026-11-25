@@ -135,6 +135,20 @@ impl Home {
         self.root.join("tasks")
     }
 
+    /// Variables a temporary machine's coordinator handed it at join, which
+    /// every task and job run on the machine gets; absent on other machines
+    #[must_use]
+    pub fn pool_env_path(&self) -> PathBuf {
+        self.root.join("temporary").join("env")
+    }
+
+    /// `iroh/secret.key`: this daemon's iroh key for the Fleet link, made on
+    /// first use and kept so its endpoint id survives restarts
+    #[must_use]
+    pub fn iroh_key_path(&self) -> PathBuf {
+        self.root.join("iroh").join("secret.key")
+    }
+
     /// `jobs/` directory: each queue job's shared state and callback delivery.
     #[must_use]
     pub fn jobs_dir(&self) -> PathBuf {

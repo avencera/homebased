@@ -786,6 +786,7 @@ impl Store {
             gpu_summaries,
             lease_idle,
             timeout,
+            machine_released: None,
         };
         self.conn.execute(
             "INSERT INTO resource_job_events (job_id, seq, event_json, created_at)

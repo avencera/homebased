@@ -20,9 +20,10 @@ http = "1.5.0"
 http-body-util = "0.1.5"
 humantime = "2.4.0"
 humantime-serde = "1.1.1"
-hyper = { version = "1.11.1", features = ["client", "http1"] }
-hyper-util = { version = "0.1.20", features = ["tokio"] }
+hyper = { version = "1.11.1", features = ["client", "http1", "server"] }
+hyper-util = { version = "0.1.20", features = ["service", "tokio"] }
 if-addrs = "0.15.0"
+iroh = { version = "1.5.0", default-features = false, features = ["tls-ring", "portmapper", "fast-apple-datapath"] }
 jsonc-parser = { version = "0.33.2", features = ["serde"] }
 libc = "0.2.189"
 mdns-sd = "0.21.4"

@@ -3,7 +3,7 @@
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -524,6 +524,21 @@ async fn receive_event(
     State(state): State<AppState>,
     Json(body): Json<ReceiveEvent>,
 ) -> Result<Json<EventBody>, AppError> {
+    accept_event(&state, body).await
+}
+
+/// `POST /v1/cluster/events` over the Fleet link: only for tasks the
+/// temporary machine on the other end runs
+pub(super) async fn member_event(
+    State(state): State<AppState>,
+    Extension(peer): Extension<super::fleet_link::LinkPeer>,
+    Json(body): Json<ReceiveEvent>,
+) -> Result<Json<EventBody>, AppError> {
+    peer.require_member(body.event.execution_machine)?;
+    accept_event(&state, body).await
+}
+
+async fn accept_event(state: &AppState, body: ReceiveEvent) -> Result<Json<EventBody>, AppError> {
     state
         .machine
         .identity
@@ -828,7 +843,7 @@ async fn cancel_execution(
     }))
 }
 
-async fn machine(fleet: FleetHandle) -> Json<MachineAdvertisement> {
+pub(super) async fn machine(fleet: FleetHandle) -> Json<MachineAdvertisement> {
     Json(fleet.advertisement().clone())
 }
 

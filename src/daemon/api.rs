@@ -58,6 +58,7 @@ pub fn read_routes() -> Router<AppState> {
         .merge(crate::daemon::context_threads::read_routes())
         .merge(crate::daemon::thread_api::read_routes())
         .merge(crate::daemon::usage_api::read_routes())
+        .merge(crate::daemon::pools::read_routes())
         .route("/v1/status", get(status))
         .route("/v1/tasks", get(list))
         .route("/v1/tasks/{id}", get(show))
@@ -101,6 +102,7 @@ pub fn socket_router(state: AppState) -> Router {
         .merge(crate::daemon::thread_control::socket_routes())
         .merge(crate::daemon::thread_detach::socket_routes())
         .merge(crate::daemon::service_api::socket_routes())
+        .merge(crate::daemon::pools::socket_routes())
         .merge(crate::daemon::retention::routes())
         .with_state(state)
 }
