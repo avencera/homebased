@@ -33,6 +33,8 @@ pub struct FakeLease {
     pub release: Option<(String, &'static str)>,
     pub gone_at: Option<DateTime<Utc>>,
     pub renewals: u32,
+    /// When the machine or the client asked to release it
+    pub release_asked_at: Option<DateTime<Utc>>,
     /// While the provider still works on a slow create: when it answers,
     /// and whether it fails
     pub provisioning: Option<(DateTime<Utc>, bool)>,
@@ -68,6 +70,10 @@ struct State {
     /// Time from a lease's create to its first heartbeat deadline; 60
     /// seconds unless a test sets it
     boot_grace: Option<Duration>,
+    /// `idle_hold_until` of every renew answer, as cloudlease names the
+    /// end of an hourly provider's paid time; absent as for a provider that
+    /// bills by the second
+    idle_hold_until: Option<DateTime<Utc>>,
 }
 
 /// The running fake
@@ -130,6 +136,11 @@ impl FakeCloudlease {
     /// Give new leases `grace` before their first renewal, as a class's boot grace
     pub fn set_boot_grace(&self, grace: std::time::Duration) {
         self.state.lock().unwrap().boot_grace = Some(Duration::from_std(grace).unwrap());
+    }
+
+    /// Answer every renew with `until` as the end of the machine's paid time
+    pub fn hold_idle_until(&self, until: DateTime<Utc>) {
+        self.state.lock().unwrap().idle_hold_until = Some(until);
     }
 
     /// End every run from cloudlease's side, releasing its leases with
@@ -358,6 +369,7 @@ fn route(
                 release: None,
                 gone_at: None,
                 renewals: 0,
+                release_asked_at: None,
                 provisioning: None,
             };
             let failed = state.failing_creates > 0;
@@ -378,6 +390,7 @@ fn route(
             (201, answer)
         }
         ("POST", ["v1", "leases", lease, action]) => {
+            let idle_hold_until = state.idle_hold_until;
             let Some(found) = state
                 .leases
                 .iter_mut()
@@ -398,12 +411,14 @@ fn route(
                         json!({
                             "heartbeat_deadline_at": found.heartbeat_deadline_at,
                             "hard_deadline_at": found.hard_deadline_at,
+                            "idle_hold_until": idle_hold_until,
                         }),
                     )
                 }
                 "release" if own || client => {
                     if found.state == "running" {
                         found.state = "releasing";
+                        found.release_asked_at = Some(Utc::now());
                         let reason = body["reason"].as_str().unwrap_or("requested").to_owned();
                         found.release = Some((reason, if own { "machine" } else { "client" }));
                     }

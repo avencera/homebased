@@ -7,8 +7,10 @@
 //! every run on it has stalled and it owes no event it withholds renewal, so
 //! cloudlease deletes it
 //! at the heartbeat deadline unless output resumes first. When it has been
-//! idle for the idle limit it releases itself. The hard deadline applies
-//! whatever this decides
+//! idle for the idle limit it releases itself, unless cloudlease's last
+//! renew answer said it may stay idle until later at no cost, as on a
+//! provider that bills every started hour: then it stays, offering its
+//! class, until that time. The hard deadline applies whatever this decides
 
 use std::time::Duration;
 
@@ -41,6 +43,26 @@ pub struct Limits {
     pub stall_after: Duration,
 }
 
+/// What cloudlease last said about how long an idle machine may stay at no cost
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleHold {
+    /// No renew has answered yet, so an idle machine waits for one before it
+    /// releases: on an hourly provider it may have most of an hour paid
+    Unknown,
+    /// cloudlease named no hold
+    None,
+    /// The machine may stay idle until this time
+    Until(DateTime<Utc>),
+}
+
+impl IdleHold {
+    /// The hold a renew answer names
+    #[must_use]
+    pub fn answered(until: Option<DateTime<Utc>>) -> Self {
+        until.map_or(Self::None, Self::Until)
+    }
+}
+
 /// What the machine does with its lease this round
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Renewal {
@@ -50,6 +72,11 @@ pub enum Renewal {
     Withhold {
         /// How many runs stalled
         stalled: usize,
+    },
+    /// Renew: idle past its limit, but the provider's paid time runs until `until`
+    Hold {
+        /// When the hold ends
+        until: DateTime<Utc>,
     },
     /// Release the lease: no work for the idle limit
     Release {
@@ -73,8 +100,15 @@ impl IdleClock {
         }
     }
 
-    /// Decide this round from what is on the machine now
-    pub fn observe(&mut self, activity: &Activity, now: DateTime<Utc>, limits: Limits) -> Renewal {
+    /// Decide this round from what is on the machine now, and `hold` from
+    /// cloudlease's last renew answer
+    pub fn observe(
+        &mut self,
+        activity: &Activity,
+        now: DateTime<Utc>,
+        limits: Limits,
+        hold: IdleHold,
+    ) -> Renewal {
         if activity.has_work() {
             self.idle_since = None;
             return busy_renewal(activity, now, limits.stall_after);
@@ -82,11 +116,15 @@ impl IdleClock {
 
         let since = *self.idle_since.get_or_insert(now);
         let idle = (now - since).to_std().unwrap_or_default();
-        if idle >= limits.idle_limit {
-            return Renewal::Release { idle_since: since };
+        if idle < limits.idle_limit {
+            return Renewal::Renew;
         }
 
-        Renewal::Renew
+        match hold {
+            IdleHold::Until(until) if now < until => Renewal::Hold { until },
+            IdleHold::Unknown => Renewal::Renew,
+            IdleHold::Until(_) | IdleHold::None => Renewal::Release { idle_since: since },
+        }
     }
 }
 
@@ -127,9 +165,12 @@ mod tests {
     fn an_idle_machine_renews_until_its_idle_limit_then_releases() {
         let mut clock = IdleClock::started(at(0));
         let idle = Activity::default();
-        assert_eq!(clock.observe(&idle, at(599), LIMITS), Renewal::Renew);
         assert_eq!(
-            clock.observe(&idle, at(600), LIMITS),
+            clock.observe(&idle, at(599), LIMITS, IdleHold::None),
+            Renewal::Renew
+        );
+        assert_eq!(
+            clock.observe(&idle, at(600), LIMITS, IdleHold::None),
             Renewal::Release { idle_since: at(0) }
         );
     }
@@ -141,12 +182,21 @@ mod tests {
             runs: vec![at(500)],
             ..Activity::default()
         };
-        assert_eq!(clock.observe(&busy, at(550), LIMITS), Renewal::Renew);
-        let idle = Activity::default();
-        assert_eq!(clock.observe(&idle, at(700), LIMITS), Renewal::Renew);
-        assert_eq!(clock.observe(&idle, at(1299), LIMITS), Renewal::Renew);
         assert_eq!(
-            clock.observe(&idle, at(1300), LIMITS),
+            clock.observe(&busy, at(550), LIMITS, IdleHold::None),
+            Renewal::Renew
+        );
+        let idle = Activity::default();
+        assert_eq!(
+            clock.observe(&idle, at(700), LIMITS, IdleHold::None),
+            Renewal::Renew
+        );
+        assert_eq!(
+            clock.observe(&idle, at(1299), LIMITS, IdleHold::None),
+            Renewal::Renew
+        );
+        assert_eq!(
+            clock.observe(&idle, at(1300), LIMITS, IdleHold::None),
             Renewal::Release {
                 idle_since: at(700)
             }
@@ -162,20 +212,26 @@ mod tests {
             undelivered: 0,
         };
         assert_eq!(
-            clock.observe(&stalled, at(1900), LIMITS),
+            clock.observe(&stalled, at(1900), LIMITS, IdleHold::None),
             Renewal::Withhold { stalled: 2 }
         );
         let resumed = Activity {
             runs: vec![at(0), at(1950)],
             ..stalled
         };
-        assert_eq!(clock.observe(&resumed, at(2000), LIMITS), Renewal::Renew);
+        assert_eq!(
+            clock.observe(&resumed, at(2000), LIMITS, IdleHold::None),
+            Renewal::Renew
+        );
         // a finished job's result still owed keeps the machine beside a stalled run
         let owing = Activity {
             undelivered: 1,
             ..stalled.clone()
         };
-        assert_eq!(clock.observe(&owing, at(1900), LIMITS), Renewal::Renew);
+        assert_eq!(
+            clock.observe(&owing, at(1900), LIMITS, IdleHold::None),
+            Renewal::Renew
+        );
     }
 
     #[test]
@@ -185,16 +241,71 @@ mod tests {
             queued_jobs: 1,
             ..Activity::default()
         };
-        assert_eq!(clock.observe(&queued, at(5000), LIMITS), Renewal::Renew);
+        assert_eq!(
+            clock.observe(&queued, at(5000), LIMITS, IdleHold::None),
+            Renewal::Renew
+        );
         let owing = Activity {
             undelivered: 1,
             ..Activity::default()
         };
-        assert_eq!(clock.observe(&owing, at(9000), LIMITS), Renewal::Renew);
+        assert_eq!(
+            clock.observe(&owing, at(9000), LIMITS, IdleHold::None),
+            Renewal::Renew
+        );
         // the idle clock starts once the last event is delivered
         assert_eq!(
-            clock.observe(&Activity::default(), at(9001), LIMITS),
+            clock.observe(&Activity::default(), at(9001), LIMITS, IdleHold::None),
             Renewal::Renew
+        );
+    }
+
+    #[test]
+    fn an_idle_machine_stays_past_its_limit_until_its_paid_time_ends() {
+        let mut clock = IdleClock::started(at(0));
+        let idle = Activity::default();
+        let paid = IdleHold::Until(at(3000));
+        assert_eq!(clock.observe(&idle, at(599), LIMITS, paid), Renewal::Renew);
+        assert_eq!(
+            clock.observe(&idle, at(600), LIMITS, paid),
+            Renewal::Hold { until: at(3000) }
+        );
+        // a job in the hold resets the idle clock, and the next hold counts from it
+        let busy = Activity {
+            runs: vec![at(1000)],
+            ..Activity::default()
+        };
+        assert_eq!(clock.observe(&busy, at(1000), LIMITS, paid), Renewal::Renew);
+        assert_eq!(clock.observe(&idle, at(1500), LIMITS, paid), Renewal::Renew);
+        assert_eq!(
+            clock.observe(&idle, at(2100), LIMITS, paid),
+            Renewal::Hold { until: at(3000) }
+        );
+        assert_eq!(
+            clock.observe(&idle, at(3000), LIMITS, paid),
+            Renewal::Release {
+                idle_since: at(1500)
+            }
+        );
+        // a hold that ends inside the idle limit changes nothing
+        let mut clock = IdleClock::started(at(0));
+        assert_eq!(
+            clock.observe(&idle, at(600), LIMITS, IdleHold::Until(at(500))),
+            Renewal::Release { idle_since: at(0) }
+        );
+        // with no renew answered yet, even a zero idle limit waits for one
+        let zero = Limits {
+            idle_limit: Duration::ZERO,
+            ..LIMITS
+        };
+        let mut clock = IdleClock::started(at(0));
+        assert_eq!(
+            clock.observe(&idle, at(0), zero, IdleHold::Unknown),
+            Renewal::Renew
+        );
+        assert_eq!(
+            clock.observe(&idle, at(1), zero, IdleHold::Until(at(900))),
+            Renewal::Hold { until: at(900) }
         );
     }
 }
