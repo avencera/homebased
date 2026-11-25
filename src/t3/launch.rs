@@ -676,6 +676,7 @@ fn set_icon(env: &T3Env, project_id: &str, change: &IconChange) -> Result<(), La
         method: CurlMethod::Post,
         url: &format!("{}{PROJECT_MUTATE_PATH}", server.origin),
         bearer: Some(&token.value),
+        headers: &[],
         json_body: Some(&update),
         timeout: PROJECT_UPDATE_TIMEOUT,
     })

@@ -1287,6 +1287,7 @@ fn require_protocol(origin: &str) -> Result<(), ApiFailure> {
         method: CurlMethod::Get,
         url: &format!("{origin}/.well-known/t3/environment"),
         bearer: None,
+        headers: &[],
         json_body: None,
         timeout: DESCRIPTOR_TIMEOUT,
     })

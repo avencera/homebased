@@ -530,6 +530,8 @@ fn attention_release_refuses_stale_identity_and_replays() {
         owes_final_event: false,
         submitted_at: None,
         placement: None,
+        rerun: None,
+        cancel_requested: false,
     };
     store.insert_job_route(&route).unwrap();
     store

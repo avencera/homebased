@@ -12,6 +12,7 @@ pub mod boot;
 pub mod bundle;
 pub mod cloudlease;
 pub mod error;
+pub mod notice;
 pub mod renewal;
 
 use std::fmt;
@@ -69,6 +70,13 @@ pub const DEFAULT_MIN_FREE_DISK_GIB: u64 = 1;
 pub fn boot_timeout_within(grace: Duration) -> Duration {
     grace.saturating_sub(BOOT_GRACE_MARGIN.min(grace / 4))
 }
+
+/// Times a job whose machine was interrupted runs again on another machine
+/// of its pool, by default
+pub const DEFAULT_JOB_RETRIES: u32 = 2;
+
+/// Most times a pool may run a job again after its machine was interrupted
+pub const MAX_JOB_RETRIES: u32 = 10;
 
 /// Machines in a row the provider could not create before a pool stops
 /// asking, so a broken class or region never turns into a create loop
@@ -347,10 +355,19 @@ pub struct PoolSettings {
     /// cap when absent
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spend_cap_cents: Option<NonZeroU32>,
+    /// Times a job whose machine was interrupted runs again on another
+    /// machine of the pool; a pool saved before the setting existed reads as
+    /// the default
+    #[serde(default = "default_job_retries")]
+    pub job_retries: u32,
 }
 
 fn default_min_free_disk_gib() -> u64 {
     DEFAULT_MIN_FREE_DISK_GIB
+}
+
+fn default_job_retries() -> u32 {
+    DEFAULT_JOB_RETRIES
 }
 
 impl PoolSettings {
@@ -609,6 +626,9 @@ pub enum ReleaseReason {
     BootTimeout,
     /// cloudlease refused to create it
     Refused,
+    /// The provider took it back, such as an AWS Spot interruption, or it
+    /// disappeared some other way
+    Interrupted,
     /// A reason this release does not know, as cloudlease sent it
     #[serde(untagged)]
     Other(String),
@@ -626,6 +646,17 @@ impl ReleaseReason {
     #[must_use]
     pub fn may_lose_output(&self) -> bool {
         !matches!(self, Self::Idle | Self::Done | Self::Refused)
+    }
+
+    /// Whether a job that lost its machine for this reason runs again on
+    /// another machine of the pool
+    ///
+    /// Only an interruption does: the job did nothing wrong and another
+    /// machine can finish it. A lapsed heartbeat does not, since it usually
+    /// means every run on the machine stalled, which a rerun would repeat
+    #[must_use]
+    pub fn reruns_job(&self) -> bool {
+        matches!(self, Self::Interrupted)
     }
 }
 
@@ -826,8 +857,21 @@ impl PoolReach {
     /// Reach of `pool` with `machines`, every one it has had, at `now`
     #[must_use]
     pub fn new(pool: &Pool, machines: &[PoolMachine], now: DateTime<Utc>) -> Self {
+        Self::without(pool, machines, None, now)
+    }
+
+    /// Reach of `pool` once the machine in slot `lost` is gone: it runs
+    /// nothing more, but its lease still shows the class's boot grace and
+    /// lifetime, which may be the only lease that does
+    fn without(
+        pool: &Pool,
+        machines: &[PoolMachine],
+        lost: Option<SlotId>,
+        now: DateTime<Utc>,
+    ) -> Self {
         let live_until = machines
             .iter()
+            .filter(|machine| Some(machine.slot) != lost)
             .filter_map(|machine| match &machine.state {
                 MachineState::Booting { lease } | MachineState::Joined { lease, .. } => {
                     Some(lease.hard_deadline_at)
@@ -955,6 +999,127 @@ pub struct MachineReleased {
     pub gone_at: DateTime<Utc>,
     /// Anything the job wrote on the machine and had not uploaded is gone
     pub output_lost: bool,
+    /// Which run of the job ended with the machine: 1 for its first, more
+    /// after its earlier machines were interrupted
+    #[serde(default = "first_attempt")]
+    pub attempt: u32,
+    /// Why a job whose machine was interrupted was not run again
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_rerun: Option<NotRerun>,
+}
+
+fn first_attempt() -> u32 {
+    1
+}
+
+/// Why a job whose machine was interrupted ended instead of running again
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "cause", rename_all = "snake_case")]
+pub enum NotRerun {
+    /// It ran as many times as its pool allows
+    RetriesExhausted {
+        /// Runs the pool allows each job: its retries and the first run
+        max_attempts: u32,
+    },
+    /// The pool takes no more jobs
+    PoolEnded,
+    /// No machine of the pool could run it to its kill limit before the
+    /// pool's deadline
+    OutOfReach,
+    /// A move pinned it to the machine that was lost
+    Pinned,
+    /// Someone asked to cancel it
+    Cancelled,
+}
+
+/// Carried by the `JOB_PREEMPTED` its origin writes when a job's temporary
+/// machine was lost and the job is queued for another machine of its pool
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineLost {
+    /// The pool
+    pub pool: PoolName,
+    /// The machine that was lost
+    pub machine: MachineName,
+    /// Why
+    pub reason: ReleaseReason,
+    /// When the provider ends the machine, from its interruption notice; the
+    /// interrupted run may go on until then, beside the rerun
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ends_at: Option<DateTime<Utc>>,
+    /// The run now queued: 2 for the first rerun
+    pub attempt: u32,
+    /// Runs the pool allows each job: its retries and the first run
+    pub max_attempts: u32,
+}
+
+/// Whether a job that lost its machine runs again, and as which attempt
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rerun {
+    /// Queue it for another machine of the pool as this attempt
+    Queue {
+        /// The attempt now queued
+        attempt: u32,
+    },
+    /// End it with its machine; `None` when the reason is never rerun
+    End(Option<NotRerun>),
+}
+
+/// What decides whether a job that lost its machine runs again
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RerunPolicy {
+    /// Runs the pool allows each job: its retries and the first run
+    pub max_attempts: u32,
+    /// What the pool's machines can still run; `None` once the pool takes
+    /// no new jobs
+    pub reach: Option<PoolReach>,
+}
+
+impl RerunPolicy {
+    /// The policy of `pool` at `now`, with `machines` every one it has had,
+    /// once the machine in slot `lost` is gone
+    #[must_use]
+    pub fn new(pool: &Pool, machines: &[PoolMachine], lost: SlotId, now: DateTime<Utc>) -> Self {
+        Self {
+            max_attempts: pool.settings.job_retries.saturating_add(1),
+            reach: matches!(pool.state, PoolState::Open)
+                .then(|| PoolReach::without(pool, machines, Some(lost), now)),
+        }
+    }
+
+    /// Decide for a job on run `attempt` with kill limit `kill` whose
+    /// machine was lost for `reason`; `pinned` when a move tied it to that
+    /// machine
+    #[must_use]
+    pub fn decide(
+        &self,
+        reason: &ReleaseReason,
+        attempt: u32,
+        kill: Duration,
+        pinned: bool,
+    ) -> Rerun {
+        if !reason.reruns_job() {
+            return Rerun::End(None);
+        }
+        if attempt >= self.max_attempts {
+            return Rerun::End(Some(NotRerun::RetriesExhausted {
+                max_attempts: self.max_attempts,
+            }));
+        }
+        if pinned {
+            return Rerun::End(Some(NotRerun::Pinned));
+        }
+        let Some(reach) = self.reach else {
+            return Rerun::End(Some(NotRerun::PoolEnded));
+        };
+        // the deadline bounds every machine, and a spend cap refuses the
+        // replacement's create, which ends the pool and the queued job with it
+        if !reach.can_run(kill) {
+            return Rerun::End(Some(NotRerun::OutOfReach));
+        }
+        Rerun::Queue {
+            attempt: attempt + 1,
+        }
+    }
 }
 
 /// What `pool show` and `pool list` print
@@ -983,6 +1148,35 @@ pub struct JoinRequest {
     pub lease: LeaseId,
     /// The single-use token from its boot data
     pub join_token: JoinToken,
+}
+
+/// Body of `POST /v1/cluster/pool/notice`, sent by a temporary machine's
+/// daemon when its provider gave notice that it ends the machine soon, such
+/// as an AWS Spot interruption notice
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InterruptionNotice {
+    /// Always 1
+    pub api_version: u32,
+    /// Pool the machine serves
+    pub pool: PoolName,
+    /// Its slot
+    pub slot: SlotId,
+    /// Its lease
+    pub lease: LeaseId,
+    /// What the provider does then, such as `terminate`
+    pub action: String,
+    /// When the provider ends the machine
+    pub ends_at: DateTime<Utc>,
+}
+
+/// Answer to an interruption notice
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoticeAnswer {
+    /// Always 1
+    pub api_version: u32,
+    /// Jobs the coordinator queued again for other machines
+    pub queued: Vec<crate::queue::JobId>,
 }
 
 /// Answer to a join: everything the machine needs that boot data must not carry
@@ -1090,6 +1284,7 @@ mod tests {
                 min_free_disk_gib: DEFAULT_MIN_FREE_DISK_GIB,
                 env_file: None,
                 spend_cap_cents: None,
+                job_retries: DEFAULT_JOB_RETRIES,
             },
             run_request: Uuid::now_v7(),
             run: None,
@@ -1245,6 +1440,82 @@ mod tests {
         assert_eq!(
             set.settings.boot_released_at(lease),
             now + chrono::Duration::minutes(2)
+        );
+    }
+
+    #[test]
+    fn only_an_interruption_reruns_and_only_within_the_limit_and_reach() {
+        let now = Utc::now();
+        let pool = test_pool(now + chrono::Duration::hours(1), None);
+        let policy = RerunPolicy::new(&pool, &[], SlotId::new(), now);
+        assert_eq!(policy.max_attempts, 3);
+        let interrupted = ReleaseReason::Interrupted;
+        assert_eq!(
+            policy.decide(&interrupted, 1, 10 * MINUTE, false),
+            Rerun::Queue { attempt: 2 }
+        );
+        assert_eq!(
+            policy.decide(&interrupted, 3, 10 * MINUTE, false),
+            Rerun::End(Some(NotRerun::RetriesExhausted { max_attempts: 3 }))
+        );
+        // a stall would repeat, so a lapsed heartbeat is never rerun
+        assert_eq!(
+            policy.decide(&ReleaseReason::HeartbeatLapsed, 1, 10 * MINUTE, false),
+            Rerun::End(None)
+        );
+        assert_eq!(
+            policy.decide(&interrupted, 1, 10 * MINUTE, true),
+            Rerun::End(Some(NotRerun::Pinned))
+        );
+        // a new machine joins within 7 minutes, so 54 minutes no longer fit
+        assert_eq!(
+            policy.decide(&interrupted, 1, 54 * MINUTE, false),
+            Rerun::End(Some(NotRerun::OutOfReach))
+        );
+
+        let mut stopped = pool.clone();
+        stopped.stop(PoolEnd::Requested);
+        assert_eq!(
+            RerunPolicy::new(&stopped, &[], SlotId::new(), now).decide(
+                &interrupted,
+                1,
+                MINUTE,
+                false
+            ),
+            Rerun::End(Some(NotRerun::PoolEnded))
+        );
+        assert_eq!(
+            ReleaseReason::from_wire("interrupted"),
+            ReleaseReason::Interrupted
+        );
+
+        // the lost machine's lease may be the only one showing a 4 minute
+        // grace: a replacement then joins within 3 minutes, so a 10 minute
+        // job fits in the 15 left, though the assumed 7 minutes would not
+        let closing = test_pool(now + chrono::Duration::minutes(15), None);
+        let lost = booting(&closing, now - chrono::Duration::minutes(5), 4, 60);
+        let policy = RerunPolicy::new(&closing, std::slice::from_ref(&lost), lost.slot, now);
+        assert_eq!(
+            policy.decide(&interrupted, 1, 10 * MINUTE, false),
+            Rerun::Queue { attempt: 2 }
+        );
+        // it runs nothing more, so a job only it could outlive is out of reach
+        let stopped_closing = {
+            let mut pool = closing.clone();
+            pool.stop(PoolEnd::Requested);
+            pool
+        };
+        assert!(
+            PoolReach::new(&stopped_closing, std::slice::from_ref(&lost), now).can_run(10 * MINUTE)
+        );
+        assert!(
+            !PoolReach::without(
+                &stopped_closing,
+                std::slice::from_ref(&lost),
+                Some(lost.slot),
+                now
+            )
+            .can_run(10 * MINUTE)
         );
     }
 

@@ -441,6 +441,8 @@ async fn submit(
                 owes_final_event: held,
                 submitted_at: ci.then_some(taken_at),
                 placement: body.placement,
+                rerun: None,
+                cancel_requested: false,
             };
             call(&state.store, |reply| StoreMsg::InsertJobRoute {
                 route: Box::new(route),
@@ -574,6 +576,7 @@ async fn cancel(
     Query(query): Query<MachineQuery>,
     QueueJson(body): QueueJson<OperationBody>,
 ) -> Result<Json<Value>, AppError> {
+    let authority;
     {
         // a held job never reached its queue, so the origin ends it
         let _guard = state.locks.job_submissions.lock(job).await;
@@ -592,11 +595,18 @@ async fn cancel(
                 .ok_or(QueueError::JobNotFound { job })?;
             return Ok(Json(held_response(view)));
         }
+        authority = job_authority(&state, job, selector).await?;
+        // under the job's lock, so a lost machine's rerun sees the request
+        call(&state.store, |reply| StoreMsg::RequestJobCancel {
+            job,
+            authority,
+            reply,
+        })
+        .await?;
     }
-    let machine = job_authority(&state, job, query.machine.as_ref()).await?;
     forward(
         &state,
-        machine,
+        authority,
         QueueRequest::Cancel {
             operation: body.operation_id,
             job,

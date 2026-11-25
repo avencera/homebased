@@ -316,6 +316,10 @@ pub struct LeaseCredential {
     /// cloudlease deletes the machine this long after its last renew
     #[serde(default)]
     heartbeat_ttl_secs: Option<u64>,
+    /// The notice the machine's provider gives before it ends the machine;
+    /// absent for a provider that gives none, and from an older cloudlease
+    #[serde(default)]
+    pub interruption_notice: Option<super::notice::NoticeSource>,
 }
 
 impl std::fmt::Debug for LeaseCredential {
@@ -409,6 +413,7 @@ fn request<T: DeserializeOwned>(
         method,
         url,
         bearer: Some(token),
+        headers: &[],
         json_body: body,
         timeout: REQUEST_TIMEOUT,
     })

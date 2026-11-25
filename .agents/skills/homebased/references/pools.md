@@ -23,6 +23,7 @@ homebased --json pool release afv
 - `--min-free-disk` (GiB, default 1) is the free disk below which a pool machine admits no job. Set it to what one job needs on disk, within what the machine class has free after boot, so a machine filled by earlier jobs stops taking new ones and idles out.
 - Jobs run with `--git` (or `--repo` and `--commit`) from the pushed commit, or in a `cwd` that the boot leaves on the machine. A fresh machine has nothing else of yours on it.
 - Private repositories work: the machine never gets a git credential. At submit the coordinator fetches the commit with its own git credentials and makes a one-commit bundle; the machine downloads it from the coordinator over the link when the run starts and checks it out. So the checkout is shallow (one commit, no tags). The submit is refused, before any machine is asked for, with `commit_unavailable` when the coordinator cannot fetch the commit (push it, or fix the remote or the coordinator's credentials), `submodules_unsupported` when the commit has a `.gitmodules`, or `bundle_too_large` past 2 GiB. A download that breaks is tried 3 times, with each failure in the run's log, before the run fails.
+- `--job-retries` (default 2, at most 10) is how many times a job whose machine was interrupted, such as by an AWS Spot interruption, runs again on another machine. Every job of such a pool must be safe to rerun (see Interrupted machines); pass `--job-retries 0` for jobs that are not.
 
 ## Lifetime rules
 
@@ -31,9 +32,17 @@ homebased --json pool release afv
 - At the pool's deadline, or after `pool release`, every machine is deleted, running or not.
 - A machine whose lease cloudlease ended (`410 lease_ended`, such as at a spend cap) stops offering the class at once; its running job ends with `machine_released` when the machine is deleted.
 
+## Interrupted machines
+
+When the provider takes a machine back (reason `interrupted`, such as an AWS Spot interruption), the coordinator queues its jobs again for another machine and the pool asks for a replacement; do nothing. Each rerun shows as `JOB_PREEMPTED` with `machine_lost` (`pool`, `machine`, `reason`, `attempt` now queued, `max_attempts`, and `ends_at` when the machine gave notice), a progress event that does not wake a sleeping thread. On AWS the machine reads the two-minute Spot notice, so the job is queued again within seconds; the interrupted run keeps going until AWS shuts the machine down, and can watch the file named by `HOMEBASED_INTERRUPTION_FILE` to save a checkpoint off the machine.
+
+So a job on such a pool must be safe to run again and to overlap a dying copy of itself for up to two minutes: derive output names from the input, upload each output whole (write, then rename or put at once), and skip work whose output exists.
+
+A rerun ends with `JOB_FAILED` and `machine_released` with `not_rerun.cause`: `retries_exhausted` (it ran `max_attempts` times), `out_of_reach` (no machine could run it to its kill limit before the deadline), `pool_ended`, `pinned`, or `cancelled` (a cancel was asked for first). A replacement past the spend cap is refused, which stops the pool and fails the queued job with `spend_cap_reached` in `held_ending`. Report a job that kept getting interrupted to the user rather than resubmitting it in a loop. `heartbeat_lapsed` is never rerun, since a stalled job would stall again.
+
 ## Outputs
 
-A job must upload its results before it exits. A job whose machine was deleted under it ends with `JOB_FAILED` carrying `machine_released` (`pool`, `machine`, `reason`, `hard_deadline_at`, `gone_at`, `output_lost`). `reason` is `hard_deadline`, `heartbeat_lapsed` (its output stalled or the machine died), `requested` (pool released), or another cloudlease reason. Anything not uploaded is lost, and so is the run's log; resubmit after fixing the cause, with a longer `--deadline` pool if it hit the deadline. A job pinned to a machine with `--machine` that never reached it, such as one still waiting on `--after`, fails with `held_ending` code `machine_released` once that machine is gone. `resource job show <job>` on the coordinator still works after the machine is deleted: it shows the job under `ended` with its `state` and saved final `event`.
+A job must upload its results before it exits. A job whose machine was deleted under it ends with `JOB_FAILED` carrying `machine_released` (`pool`, `machine`, `reason`, `hard_deadline_at`, `gone_at`, `output_lost`). `reason` is `hard_deadline`, `heartbeat_lapsed` (its output stalled or the machine died), `requested` (pool released), `interrupted` (see above), or another cloudlease reason. `attempt` says which run ended. Anything not uploaded is lost, and so is the run's log; resubmit after fixing the cause, with a longer `--deadline` pool if it hit the deadline. A job pinned to a machine with `--machine` that never reached it, such as one still waiting on `--after`, fails with `held_ending` code `machine_released` once that machine is gone. `resource job show <job>` on the coordinator still works after the machine is deleted: it shows the job under `ended` with its `state` and saved final `event`.
 
 ## Inspect
 
