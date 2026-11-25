@@ -301,7 +301,8 @@ fn memory_holds(
     waiting: &[&JobView],
     taken: &[(ResourceId, &JobView)],
 ) -> BTreeMap<JobId, MemoryHold> {
-    // the job whose end frees a busy resource, with the peak it frees
+    // the job whose end frees a busy resource, with the peak it frees; none
+    // when that amount is unknown
     let ahead = |resource: &ResourceView| {
         let job = match &resource.run {
             Some(run) => run.phase.holds_job().then_some(run.job),
@@ -329,19 +330,21 @@ fn memory_holds(
                 .find(|first| first.target.allows(resource.id))
                 .is_some_and(|first| first.id == job.id)
         });
-        let Some(least) = next_for
-            .map(|resource| ahead(resource).unwrap_or((0, job.id)))
-            .min_by_key(|(freed, _)| *freed)
-        else {
+        let ahead: Vec<Option<(u64, JobId)>> = next_for.map(ahead).collect();
+        if ahead.is_empty() {
             continue;
-        };
-        let (freed, behind) = least;
+        }
+        // any unknown amount credits nothing, so then the whole peak is held
+        // and there is no job to watch
+        let behind: Option<Vec<(u64, JobId)>> = ahead.into_iter().collect();
+        let behind = behind.unwrap_or_default();
+        let freed = behind.iter().map(|(freed, _)| *freed).min().unwrap_or(0);
         holds.insert(
             job.id,
             MemoryHold {
                 peak,
                 held: peak.bytes().saturating_sub(freed),
-                behind: (freed > 0).then_some(behind),
+                behind: behind.into_iter().map(|(_, job)| job).collect(),
             },
         );
     }

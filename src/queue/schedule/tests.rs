@@ -549,11 +549,11 @@ fn a_job_behind_that_waits_for_memory_holds_back_no_preemption() {
     assert_eq!(decisions.preemption, None);
 }
 
-fn hold(peak: f64, held_gib: u64, behind: Option<JobId>) -> MemoryHold {
+fn hold(peak: f64, held_gib: u64, behind: &[JobId]) -> MemoryHold {
     MemoryHold {
         peak: MemPeak::from_gib(peak).unwrap(),
         held: held_gib << 30,
-        behind,
+        behind: behind.to_vec(),
     }
 }
 
@@ -578,18 +578,18 @@ fn the_job_next_for_a_busy_gpu_holds_what_the_run_ahead_will_not_free() {
     let decisions = decide(&machine.snapshot(t0()));
     assert_eq!(
         decisions.memory_holds.into_iter().collect::<Vec<_>>(),
-        [(trace, hold(28.0, 24, Some(predict)))]
+        [(trace, hold(28.0, 24, &[predict]))]
     );
 
     // a run without a peak frees an unknown amount, so the whole peak is held
     machine.set_peak(predict, None);
     let holds = decide(&machine.snapshot(t0())).memory_holds;
-    assert_eq!(holds.get(&trace), Some(&hold(28.0, 28, None)));
+    assert_eq!(holds.get(&trace), Some(&hold(28.0, 28, &[])));
 
     // a run that frees at least the peak leaves nothing to hold until it ends
     machine.set_peak(predict, Some(28.0));
     let holds = decide(&machine.snapshot(t0())).memory_holds;
-    assert_eq!(holds.get(&trace), Some(&hold(28.0, 0, Some(predict))));
+    assert_eq!(holds.get(&trace), Some(&hold(28.0, 0, &[predict])));
 
     // a run cleaning up after a preemption already gave its memory back,
     // though its job is still queued, so the whole peak is held
@@ -603,7 +603,7 @@ fn the_job_next_for_a_busy_gpu_holds_what_the_run_ahead_will_not_free() {
         .state = QueuedState::Queued;
     machine.set_run(gpu0, predict, task, RunPhase::Cleaning { attempt: 1 });
     let holds = decide(&machine.snapshot(t0())).memory_holds;
-    assert_eq!(holds.get(&trace), Some(&hold(28.0, 28, None)));
+    assert_eq!(holds.get(&trace), Some(&hold(28.0, 28, &[])));
 }
 
 #[test]
@@ -624,8 +624,28 @@ fn a_job_holds_for_the_busy_resources_it_is_next_for() {
     // the pinned job is next for gpu0 and the any job for gpu1, which it
     // takes when gpu1 frees first, so each holds behind its own resource
     let holds = decide(&machine.snapshot(t0())).memory_holds;
-    assert_eq!(holds.get(&pinned), Some(&hold(10.0, 8, Some(first))));
-    assert_eq!(holds.get(&any), Some(&hold(20.0, 14, Some(second))));
+    assert_eq!(holds.get(&pinned), Some(&hold(10.0, 8, &[first])));
+    assert_eq!(holds.get(&any), Some(&hold(20.0, 14, &[second])));
+}
+
+#[test]
+fn an_any_job_waiting_for_several_busy_gpus_watches_every_job_ahead() {
+    let mut machine = Machine::new(&["gpu0", "gpu1"]);
+    let (small, _) = machine.running("gpu0", Priority::Medium, HELD, executing(t0()));
+    let (large, _) = machine.running("gpu1", Priority::Medium, HELD, executing(t0()));
+    let job = machine.queued(Priority::Medium, Target::Any, YIELD);
+    machine.set_peak(small, Some(2.0));
+    machine.set_peak(large, Some(4.0));
+    machine.set_peak(job, Some(6.0));
+    machine.set_hold_room(job);
+
+    // either run may end first, so only the smaller one's 2 GiB comes off,
+    // and the larger one ending first must not leave the hold at 4 GiB
+    let holds = decide(&machine.snapshot(t0())).memory_holds;
+    let held = holds.get(&job).unwrap();
+    assert_eq!(held, &hold(6.0, 4, &[small, large]));
+    assert_eq!(held.bytes(|ahead| ahead != large), 6 << 30);
+    assert_eq!(held.bytes(|_| true), 4 << 30);
 }
 
 #[test]
@@ -662,7 +682,7 @@ fn a_job_behind_a_launch_this_pass_holds_what_that_launch_will_not_free() {
     );
     assert_eq!(
         decisions.memory_holds.get(&trace),
-        Some(&hold(28.0, 24, Some(predict)))
+        Some(&hold(28.0, 24, &[predict]))
     );
 }
 

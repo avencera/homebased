@@ -583,7 +583,7 @@ mod tests {
             MemoryHold {
                 peak: MemPeak::parse("8").unwrap(),
                 held: 6 * GIB,
-                behind: Some(predict),
+                behind: vec![predict],
             },
         );
 

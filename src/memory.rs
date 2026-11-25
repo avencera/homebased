@@ -186,17 +186,21 @@ impl fmt::Display for MemoryWait {
 
 /// Room a queued job holds back from tasks while the resources it waits for
 /// are busy, so tasks cannot take what it needs before the run ahead ends
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryHold {
     /// The job's peak
     pub peak: MemPeak,
     /// Bytes held: the peak less what the job ahead of it frees when it ends
     pub held: u64,
-    /// The job ahead whose peak `held` leaves out; once that job no longer
-    /// claims its peak, its memory is already back, so the whole peak is held
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub behind: Option<JobId>,
+    /// The jobs ahead on the resources it waits for, whose least peak
+    /// `held` leaves out; once any of them no longer claims its peak, the job
+    /// may take that resource with that memory already back, so the whole
+    /// peak is held
+    // kept inside the daemon, so the listing reads the same to a CLI from the
+    // release that added `memory_holds`, which refuses unknown fields
+    #[serde(skip)]
+    pub behind: Vec<JobId>,
 }
 
 impl MemoryHold {
@@ -207,9 +211,10 @@ impl MemoryHold {
     /// comes off the hold
     #[must_use]
     pub fn bytes(&self, still_claims: impl Fn(JobId) -> bool) -> u64 {
-        match self.behind {
-            Some(job) if !still_claims(job) => self.peak.bytes(),
-            _ => self.held,
+        if self.behind.iter().all(|job| still_claims(*job)) {
+            self.held
+        } else {
+            self.peak.bytes()
         }
     }
 }
