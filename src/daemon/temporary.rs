@@ -5,7 +5,9 @@
 //! coordinator with the single-use token from its config, stores the
 //! variables the coordinator hands over, and offers the pool's CI class.
 //! Each round it decides from what runs here whether to renew, withhold, or
-//! release; see [`crate::pool::renewal`]. Before an idle release it stops
+//! release; see [`crate::pool::renewal`]. Past its idle limit it keeps
+//! renewing, and offering its class, while cloudlease's last renew answer
+//! says the provider's paid time runs on. Before an idle release it stops
 //! offering the class and checks again, so a job placed in that instant
 //! keeps it alive and none can be queued after the check
 
@@ -27,8 +29,8 @@ use crate::domain::API_VERSION;
 use crate::error::AppError;
 use crate::fleet::address::MachineAddress;
 use crate::fleet::http::{ClusterClient, DEFAULT_MAX_BODY};
-use crate::pool::cloudlease::{CloudleaseError, LeaseCredential, SelfRelease};
-use crate::pool::renewal::{Activity, IdleClock, Limits, Renewal};
+use crate::pool::cloudlease::{CloudleaseError, LeaseCredential, Renewed, SelfRelease};
+use crate::pool::renewal::{Activity, IdleClock, IdleHold, Limits, Renewal};
 use crate::pool::{JoinAnswer, JoinRequest};
 use crate::queue::ci::SlotCapacity;
 use crate::store::queue::interface::QueueRequest;
@@ -84,6 +86,10 @@ pub(super) async fn run(state: AppState, config: TemporaryConfig) {
     };
     let mut clock = IdleClock::started(Utc::now());
     let mut withheld = false;
+    // from the last renew that answered; an older answer names the same paid
+    // hour or one already over, so keeping it after a failed renew is safe
+    let mut hold = IdleHold::Unknown;
+    let mut held = false;
     let round = lease.renew_interval(config.renew_interval);
     let mut tick = tokio::time::interval(round);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -96,18 +102,30 @@ pub(super) async fn run(state: AppState, config: TemporaryConfig) {
                 continue;
             }
         };
-        let decision = clock.observe(&activity, Utc::now(), limits);
+        let decision = clock.observe(&activity, Utc::now(), limits, hold);
         // a setup or a reopen that failed is tried again each round the
         // machine is not releasing; until then it takes no CI job
         if !offered && !matches!(decision, Renewal::Release { .. }) {
             offered = setup(&state, &coordinator, &answer).await;
         }
         match decision {
-            Renewal::Renew => {
+            Renewal::Renew | Renewal::Hold { .. } => {
+                if let Renewal::Hold { until } = decision
+                    && !held
+                {
+                    info!(%until, "idle past its limit: staying until its paid time ends");
+                }
+                held = matches!(decision, Renewal::Hold { .. });
                 withheld = false;
-                if renew(&lease, round).await == LeaseEnd::Ended {
-                    close_class(&state, &answer).await;
-                    break;
+                match renew(&lease, round).await {
+                    RenewOutcome::Renewed(renewed) => {
+                        hold = IdleHold::answered(renewed.idle_hold_until);
+                    }
+                    RenewOutcome::Failed => {}
+                    RenewOutcome::Ended => {
+                        close_class(&state, &answer).await;
+                        break;
+                    }
                 }
             }
             Renewal::Withhold { stalled } => {
@@ -316,11 +334,20 @@ enum LeaseEnd {
     Ended,
 }
 
+/// How a round's renew went
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RenewOutcome {
+    Renewed(Renewed),
+    /// Every attempt this round failed; the next round tries again
+    Failed,
+    Ended,
+}
+
 /// Renew the lease, trying again within this round when a call fails
 ///
 /// cloudlease's heartbeat window is a few renew rounds long, so a brief
 /// outage must not wait out whole rounds before the next attempt
-async fn renew(lease: &LeaseCredential, round: Duration) -> LeaseEnd {
+async fn renew(lease: &LeaseCredential, round: Duration) -> RenewOutcome {
     let started = tokio::time::Instant::now();
     loop {
         let call = lease.clone();
@@ -332,10 +359,10 @@ async fn renew(lease: &LeaseCredential, round: Duration) -> LeaseEnd {
                 })
             });
         let error = match renewed {
-            Ok(_) => return LeaseEnd::Live,
+            Ok(renewed) => return RenewOutcome::Renewed(renewed),
             Err(error) if error.is_gone() => {
                 warn!("lease renewal refused: {error}");
-                return LeaseEnd::Ended;
+                return RenewOutcome::Ended;
             }
             Err(error) => error,
         };
@@ -343,7 +370,7 @@ async fn renew(lease: &LeaseCredential, round: Duration) -> LeaseEnd {
         // the next round tries again
         if started.elapsed() + RENEW_RETRY >= round {
             warn!("lease renewal failed: {error}");
-            return LeaseEnd::Live;
+            return RenewOutcome::Failed;
         }
         warn!("lease renewal failed, retrying: {error}");
         tokio::time::sleep(RENEW_RETRY).await;

@@ -186,6 +186,11 @@ pub struct Renewed {
     pub heartbeat_deadline_at: DateTime<Utc>,
     /// The lease ends at this time whatever happens
     pub hard_deadline_at: DateTime<Utc>,
+    /// An idle machine may stay until this time without adding to its bill,
+    /// as the rest of a provider hour already paid for; absent when holding
+    /// it gains nothing, as on a provider that bills by the second
+    #[serde(default)]
+    pub idle_hold_until: Option<DateTime<Utc>>,
 }
 
 /// Why a machine releases its own lease

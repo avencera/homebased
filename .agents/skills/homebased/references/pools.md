@@ -26,7 +26,7 @@ homebased --json pool release afv
 ## Lifetime rules
 
 - A machine renews its lease only while a run on it wrote output within `--stall-after`, jobs wait in its queue, or it still owes events. A job that goes silent longer than that loses its machine a few minutes later, when cloudlease's heartbeat window (3 minutes by default) ends.
-- A machine with no work for `--idle-limit` stops offering the class and releases itself.
+- A machine with no work for `--idle-limit` stops offering the class and releases itself. On an hourly-billed provider (phoenixNAP, Latitude.sh) it first stays until 10 minutes before its paid hour ends, still taking jobs, as cloudlease names in its renew answers; it never starts a new paid hour for that, and never stays past the pool's deadline.
 - At the pool's deadline, or after `pool release`, every machine is deleted, running or not.
 - A machine whose lease cloudlease ended (`410 lease_ended`, such as at a spend cap) stops offering the class at once; its running job ends with `machine_released` when the machine is deleted.
 

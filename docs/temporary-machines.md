@@ -43,7 +43,7 @@ homebased pool release afv
 | `--max` | Most machines alive at once, 1 to 64. cloudlease enforces it too |
 | `--deadline` | No machine of the pool lives past this time from now, at most 24h. cloudlease enforces it |
 | `--slots` | CI slots of the class on each machine (default 1) |
-| `--idle-limit` | A machine with no work for this long releases itself (default 10m) |
+| `--idle-limit` | A machine with no work for this long releases itself (default 10m); on an hourly-billed provider it stays until shortly before its paid hour ends, if that is later |
 | `--stall-after` | Running work with no output for this long stops keeping its machine (default 30m) |
 | `--boot-timeout` | A machine that has not joined this long after its create is released. By default a minute before cloudlease's boot grace ends, or a quarter of the grace for one under 4 minutes; the coordinator reads the grace from each lease's first `heartbeat_deadline_at`, so DigitalOcean's 8 minutes gives 7m and phoenixNAP's 20 gives 19m. A machine renews only once it joined, so cloudlease deletes it at the end of the grace anyway; a value past the grace only changes the reason to `heartbeat_lapsed`. Must be shorter than `--deadline`; `pool create` refuses an equal or longer value with `usage`, because no machine could then join before the pool ends |
 | `--min-free-disk` | Free disk, in GiB, below which a machine of the pool admits no CI run (default 1; a Fleet machine's `[ci] min_free_disk_gib` is 10). The boot data writes it as the machine's `[ci] min_free_disk_gib`. Set it to what one job needs, within what the class has free after boot; a machine below it takes no job, idles out, and a fresh one replaces it |
@@ -106,10 +106,13 @@ The machine's boot data, written by the coordinator and passed through cloudleas
 | Events it owes the coordinator are not delivered yet | renew |
 | No work, idle less than `--idle-limit` | renew |
 | Every run went silent for `--stall-after`, and it owes no events | do not renew: cloudlease deletes the machine when its heartbeat window ends (3 minutes by default) unless output resumes |
-| No work for `--idle-limit` | stop offering the CI class, so no job can be queued, check again that nothing arrived, then release the lease |
+| No work for `--idle-limit`, and the last renew answer's `idle_hold_until` is later | renew and keep offering the CI class: the provider already billed this time, so a job that arrives runs on the machine |
+| No work for `--idle-limit`, and no later `idle_hold_until` | stop offering the CI class, so no job can be queued, check again that nothing arrived, then release the lease |
 | Renewal answered `410 lease_ended`: cloudlease ended the lease, such as at a spend cap | stop offering the CI class and stop renewing; running work goes on until cloudlease deletes the machine |
 
 A renewal that fails, such as with no answer or `401 unauthorized`, is tried again every 5 seconds within the round, then the next round; cloudlease's heartbeat window, 3 minutes by default, spans several rounds. Its hard deadline applies whatever the machine decides.
+
+On a provider that bills every started hour, phoenixNAP and Latitude.sh, cloudlease names in each renew answer when the machine's paid hour ends, less 10 minutes for the release to finish, as `idle_hold_until`. An idle machine stays until then instead of releasing at `--idle-limit`, so a job that arrives in that window uses time already paid for. The hold applies at once in the first hour. After it, cloudlease names no hold within the boot grace after each hour from create turns, when the provider's next hour could start before then, since it does not know exactly when the provider's billing started; nor when the hold would pass the lease's hard deadline, and so the pool's deadline; or on a provider that bills by the second, DigitalOcean and AWS. A hold never starts a new hour, so it adds nothing to the run's spend or its spend cap. If `--idle-limit` ends after the hold, the machine releases at `--idle-limit` as before. A machine also waits for its first renew answer before an idle release, so even `--idle-limit 0s` keeps a hold cloudlease names.
 
 ## Outputs and lost machines
 
@@ -167,7 +170,7 @@ The full contract is the "Temporary machines contract" section of the cloudlease
 | `POST /v1/leases/{lease}/release` | Release one machine |
 | `POST /v1/runs/{run}/release` | Release the pool |
 
-The machine calls, with its lease token, `POST /v1/leases/{lease}/renew` and `POST /v1/leases/{lease}/release` (`{"reason": "idle"}`). A `410 lease_ended` answer to a renew means the machine is going away.
+The machine calls, with its lease token, `POST /v1/leases/{lease}/renew` and `POST /v1/leases/{lease}/release` (`{"reason": "idle"}`). A renew answers `heartbeat_deadline_at`, `hard_deadline_at`, and `idle_hold_until` (a time or `null`); a `410 lease_ended` answer means the machine is going away.
 
 ## Not covered
 

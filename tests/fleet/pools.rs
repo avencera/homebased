@@ -1295,3 +1295,87 @@ fn a_deleted_pool_machine_leaves_every_job_an_ending_and_a_status() {
     );
     assert_eq!(shown["held"]["state"], "failed", "{shown}");
 }
+
+#[test]
+fn an_idle_machine_stays_until_its_paid_time_ends_and_takes_a_job_meanwhile() {
+    let fake = FakeCloudlease::start(Duration::from_secs(4));
+    let origin = coordinator(&fake);
+    let thread = thread(&origin);
+    cli(
+        &origin,
+        thread,
+        &[
+            "pool",
+            "create",
+            "metal",
+            "--machine-class",
+            "pnap-s2",
+            "--max",
+            "1",
+            "--deadline",
+            "1h",
+            "--idle-limit",
+            "2s",
+        ],
+    );
+
+    // the first job runs until the test lets it end, so the hold starts
+    // from a known moment however long the machine took to boot
+    let marker = origin.user_home.join("first-may-end");
+    let first = run(
+        &origin,
+        thread,
+        "metal",
+        &format!("while [ ! -e {} ]; do sleep 0.2; done", marker.display()),
+    );
+    let mut machines = Machines::default();
+    assert!(
+        machines.drive(&fake, Duration::from_secs(90), || {
+            fake.leases().iter().any(|lease| lease.renewals > 0)
+        }),
+        "the machine never renewed: {}",
+        pool(&origin, thread, "metal")
+    );
+    let hold_until = chrono::Utc::now() + chrono::Duration::seconds(20);
+    fake.hold_idle_until(hold_until);
+    fs::write(&marker, "").unwrap();
+    assert!(machines.drive(&fake, Duration::from_secs(30), || {
+        final_event(&origin, first).is_some()
+    }));
+    let idle_from = chrono::Utc::now();
+
+    // well past its 2 second idle limit the machine is still there
+    machines.drive(&fake, Duration::from_secs(6), || false);
+    let leases = fake.leases();
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0].state, "running", "released at its idle limit");
+    assert!(chrono::Utc::now() - idle_from >= chrono::Duration::seconds(5));
+
+    // a job that arrives while it waits runs on it, with no new machine
+    let second = run(&origin, thread, "metal", "true");
+    assert!(machines.drive(&fake, Duration::from_secs(30), || {
+        final_event(&origin, second).is_some()
+    }));
+    assert_eq!(
+        final_event(&origin, second).unwrap().event,
+        JobEventKind::JobSucceeded
+    );
+    assert_eq!(fake.leases().len(), 1, "the job asked for a new machine");
+
+    // once its paid time ends it releases itself as idle, and not before
+    assert!(
+        machines.drive(&fake, Duration::from_secs(40), || {
+            fake.leases()[0].release_asked_at.is_some()
+        }),
+        "the machine never released: {}",
+        pool(&origin, thread, "metal")
+    );
+    let lease = fake.leases().remove(0);
+    assert_eq!(lease.release.unwrap(), ("idle".to_owned(), "machine"));
+    let asked = lease.release_asked_at.unwrap();
+    assert!(
+        asked >= hold_until,
+        "released at {asked}, held until {hold_until}"
+    );
+    assert!(asked - hold_until < chrono::Duration::seconds(10));
+}
