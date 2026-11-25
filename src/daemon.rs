@@ -44,6 +44,7 @@ pub mod usage_api;
 mod wait_api;
 pub mod web;
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -65,6 +66,7 @@ use crate::domain::TaskId;
 use crate::error::AppError;
 use crate::files::StreamSlots;
 use crate::fleet::FleetState;
+use crate::fleet::address::MachineAddress;
 use crate::fleet::directory::LocalMachine;
 use crate::fleet::protocol::SUPPORTED_PROTOCOLS;
 use crate::fleet::runtime::{FleetRuntime, FleetStart, RuntimeTimings};
@@ -194,7 +196,6 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
     let store = call(&supervisor, |reply| SupervisorMsg::GetStore { reply }).await?;
     let waiters = call(&supervisor, |reply| SupervisorMsg::GetWaiters { reply }).await?;
     let memory = call(&supervisor, |reply| SupervisorMsg::GetMemory { reply }).await?;
-    let fleet_runtime = start_fleet(&home, &config, &machine, web_addr);
     let iroh = config
         .fleet_settings()
         .and_then(|settings| settings.iroh.as_ref());
@@ -205,6 +206,13 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
         }
         None => None,
     };
+    // the Fleet's directory starts with the link's forwarders among its
+    // configured addresses, so they exist first
+    let link_forwarders = match (&link, config.fleet_settings()) {
+        (Some(link), Some(settings)) => link.allow_fleet(settings).await?,
+        _ => BTreeMap::new(),
+    };
+    let fleet_runtime = start_fleet(&home, &config, &machine, web_addr, link_forwarders);
     let fleet = fleet_runtime
         .as_ref()
         .map_or(FleetState::Disabled, |runtime| {
@@ -270,6 +278,9 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
     let link_server = link
         .clone()
         .map(|link| tokio::spawn(fleet_link::serve(state.clone(), link)));
+    if let (Some(link), Some(settings)) = (&link, config.fleet_settings()) {
+        link.dial_fleet(&state, settings);
+    }
     let temporary_member = config
         .temporary
         .clone()
@@ -406,6 +417,7 @@ fn start_fleet(
     config: &Config,
     machine: &LocalMachine,
     listener: Option<SocketAddr>,
+    link_forwarders: BTreeMap<iroh::EndpointId, MachineAddress>,
 ) -> Option<FleetRuntime> {
     let settings = config.fleet_settings()?;
     if listener.is_none() {
@@ -415,6 +427,7 @@ fn start_fleet(
     let start = FleetStart {
         local: machine.clone(),
         settings: settings.clone(),
+        link_forwarders,
         listener,
         peers_path: home.fleet_peers_path(),
         dashboard_url: config.dashboard.https_url.clone(),

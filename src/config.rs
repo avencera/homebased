@@ -249,22 +249,112 @@ pub enum Fleet {
 pub struct FleetSettings {
     /// Automatic discovery providers
     pub discovery: Discovery,
-    /// Declared peer addresses, unique after normalization
-    pub machines: Vec<MachineAddress>,
+    /// Declared peers, each with its transports in the order to try them.
+    /// No HTTP address or endpoint id appears in two entries
+    pub machines: Vec<FleetMachine>,
     /// The iroh link, when `[fleet.iroh]` is present
     pub iroh: Option<IrohConfig>,
 }
 
+impl FleetSettings {
+    /// Endpoint ids this daemon serves the whole Fleet API over the link:
+    /// `[fleet.iroh] peers` and the `iroh` id of every declared machine
+    #[must_use]
+    pub fn link_peers(&self) -> BTreeSet<iroh::EndpointId> {
+        let declared = self
+            .machines
+            .iter()
+            .filter_map(|machine| machine.iroh().map(|link| link.id));
+        let listed = self.iroh.iter().flat_map(|iroh| iroh.peers.iter().copied());
+        declared.chain(listed).collect()
+    }
+}
+
+/// One `[[fleet.machines]]` entry: the ways to reach one peer, most
+/// preferred first
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FleetMachine {
+    // never empty, and at most one transport of each kind
+    transports: Vec<MachineTransport>,
+}
+
+impl FleetMachine {
+    /// A peer reached over plain HTTP only, the form older configs use
+    #[must_use]
+    pub fn http(address: MachineAddress) -> Self {
+        Self {
+            transports: vec![MachineTransport::Http(address)],
+        }
+    }
+
+    /// Transports in the order a caller tries them
+    #[must_use]
+    pub fn transports(&self) -> &[MachineTransport] {
+        &self.transports
+    }
+
+    /// The HTTP base address, when HTTP is one of the transports
+    #[must_use]
+    pub fn http_address(&self) -> Option<&MachineAddress> {
+        self.transports
+            .iter()
+            .find_map(|transport| match transport {
+                MachineTransport::Http(address) => Some(address),
+                MachineTransport::Iroh(_) => None,
+            })
+    }
+
+    /// Where to dial the peer on the link, when iroh is one of the transports
+    #[must_use]
+    pub fn iroh(&self) -> Option<&crate::fleet::iroh::LinkAddr> {
+        self.transports
+            .iter()
+            .find_map(|transport| match transport {
+                MachineTransport::Iroh(link) => Some(link),
+                MachineTransport::Http(_) => None,
+            })
+    }
+}
+
+/// One way to reach a declared peer
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "transport", content = "address", rename_all = "snake_case")]
+pub enum MachineTransport {
+    /// Plain HTTP to the peer's listener. No authentication
+    Http(MachineAddress),
+    /// The Fleet link to the peer's iroh endpoint, which authenticates both
+    /// ends by endpoint id
+    Iroh(crate::fleet::iroh::LinkAddr),
+}
+
+/// Transport names `transports` lists
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TransportKind {
+    Http,
+    Iroh,
+}
+
+impl TransportKind {
+    /// Its name in `transports`, and the entry key that holds its address
+    fn names(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Http => ("http", "address"),
+            Self::Iroh => ("iroh", "iroh"),
+        }
+    }
+}
+
 /// This daemon's iroh endpoint for the Fleet link
-///
-/// Today only a pool's coordinator and its temporary machines use it; other
-/// Fleet traffic stays on plain HTTP
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct IrohConfig {
     /// Relays the endpoint uses to find its peers
     pub relays: crate::fleet::iroh::Relays,
     /// IPv4 UDP port of the endpoint; `0` picks one at each start
     pub port: u16,
+    /// Endpoint ids, besides those of `[[fleet.machines]]`, that may use the
+    /// whole Fleet API over the link
+    pub peers: BTreeSet<iroh::EndpointId>,
 }
 
 /// Automatic discovery providers
@@ -939,6 +1029,8 @@ struct RawIroh {
     relays: crate::fleet::iroh::Relays,
     #[serde(default)]
     port: Option<u16>,
+    #[serde(default)]
+    peers: Vec<iroh::EndpointId>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -969,7 +1061,128 @@ fn default_true() -> bool {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawMachine {
-    address: MachineAddress,
+    #[serde(default)]
+    address: Option<MachineAddress>,
+    #[serde(default)]
+    iroh: Option<iroh::EndpointId>,
+    #[serde(default)]
+    iroh_relay: Option<iroh::RelayUrl>,
+    #[serde(default)]
+    iroh_addrs: Vec<std::net::SocketAddr>,
+    #[serde(default)]
+    transports: Option<Vec<TransportKind>>,
+}
+
+impl RawMachine {
+    fn validate(self, index: usize) -> Result<FleetMachine, String> {
+        let at = format!("fleet.machines[{index}]");
+        if self.iroh.is_none() && (self.iroh_relay.is_some() || !self.iroh_addrs.is_empty()) {
+            return Err(format!("{at}: iroh_relay and iroh_addrs need iroh"));
+        }
+        let given: Vec<TransportKind> = [
+            self.address.as_ref().map(|_| TransportKind::Http),
+            self.iroh.as_ref().map(|_| TransportKind::Iroh),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if given.is_empty() {
+            return Err(format!(
+                "{at} needs an address, an iroh endpoint id, or both"
+            ));
+        }
+        // with no list, HTTP comes first: the first rollout stage keeps
+        // today's path and adds the link as its fallback
+        let order = self.transports.unwrap_or_else(|| given.clone());
+        let listed: BTreeSet<TransportKind> = order.iter().copied().collect();
+        if listed.len() != order.len() {
+            return Err(format!("{at}.transports lists a transport more than once"));
+        }
+        if let Some(missing) = order.iter().find(|kind| !given.contains(kind)) {
+            let (name, key) = missing.names();
+            return Err(format!(
+                "{at}.transports lists {name} but {at}.{key} is not set"
+            ));
+        }
+        // an address the list leaves out would never be used, so it is
+        // refused rather than silently ignored
+        if let Some(unused) = given.iter().find(|kind| !listed.contains(kind)) {
+            let (name, key) = unused.names();
+            return Err(format!(
+                "{at}.transports leaves out {name}; add it or remove {at}.{key}"
+            ));
+        }
+
+        let (mut address, mut iroh) = (self.address, self.iroh);
+        let transports = order
+            .into_iter()
+            .filter_map(|kind| match kind {
+                TransportKind::Http => address.take().map(MachineTransport::Http),
+                TransportKind::Iroh => iroh.take().map(|id| {
+                    MachineTransport::Iroh(crate::fleet::iroh::LinkAddr {
+                        id,
+                        relay: self.iroh_relay.clone(),
+                        addrs: self.iroh_addrs.clone(),
+                    })
+                }),
+            })
+            .collect();
+        Ok(FleetMachine { transports })
+    }
+}
+
+/// Validate each `[[fleet.machines]]` entry, and that no HTTP address or
+/// endpoint id names two entries
+fn validate_machines(
+    raw: Vec<RawMachine>,
+    relays: Option<&crate::fleet::iroh::Relays>,
+) -> Result<Vec<FleetMachine>, String> {
+    let mut addresses = BTreeSet::new();
+    let mut ids = BTreeSet::new();
+    let mut machines = Vec::with_capacity(raw.len());
+    for (index, machine) in raw.into_iter().enumerate() {
+        let machine = machine.validate(index)?;
+        if let Some(address) = machine.http_address()
+            && !addresses.insert(address.clone())
+        {
+            return Err(format!(
+                "fleet.machines[{index}].address {address} is listed more than once"
+            ));
+        }
+        if let Some(endpoint) = machine.iroh() {
+            let Some(relays) = relays else {
+                return Err(format!(
+                    "fleet.machines[{index}].iroh needs [fleet.iroh] to run this daemon's endpoint"
+                ));
+            };
+            // only n0's lookup finds an endpoint by its id alone, and with
+            // relays off a relay url is never dialed
+            let findable = match relays {
+                crate::fleet::iroh::Relays::N0 => true,
+                crate::fleet::iroh::Relays::Custom(_) => {
+                    endpoint.relay.is_some() || !endpoint.addrs.is_empty()
+                }
+                crate::fleet::iroh::Relays::Disabled => !endpoint.addrs.is_empty(),
+            };
+            if !findable {
+                let needs = match relays {
+                    crate::fleet::iroh::Relays::Disabled => "iroh_addrs",
+                    _ => "iroh_relay or iroh_addrs",
+                };
+                return Err(format!(
+                    "fleet.machines[{index}]: with relays = {relays}, set {needs}"
+                ));
+            }
+            if !ids.insert(endpoint.id) {
+                return Err(format!(
+                    "fleet.machines[{index}].iroh {} is listed more than once",
+                    endpoint.id
+                ));
+            }
+        }
+        machines.push(machine);
+    }
+    Ok(machines)
 }
 
 impl RawConfig {
@@ -984,6 +1197,7 @@ impl RawConfig {
         let iroh = iroh.map(|raw| IrohConfig {
             relays: raw.relays,
             port: raw.port.unwrap_or(crate::fleet::iroh::DEFAULT_PORT),
+            peers: raw.peers.into_iter().collect(),
         });
         let notify = self.notify.validate()?;
         let sleep = self.power.policy();
@@ -1008,21 +1222,11 @@ impl RawConfig {
             );
         }
         let discovery = discovery.validate()?;
-        let mut seen = BTreeSet::new();
-        let mut addresses = Vec::with_capacity(machines.len());
-        for (index, machine) in machines.into_iter().enumerate() {
-            if !seen.insert(machine.address.clone()) {
-                return Err(format!(
-                    "fleet.machines[{index}].address {} is listed more than once",
-                    machine.address
-                ));
-            }
-            addresses.push(machine.address);
-        }
+        let machines = validate_machines(machines, iroh.as_ref().map(|iroh| &iroh.relays))?;
         let fleet = if enabled {
             Fleet::Enabled(FleetSettings {
                 discovery,
-                machines: addresses,
+                machines,
                 iroh,
             })
         } else {
@@ -1065,10 +1269,13 @@ impl RawDiscovery {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use super::{Config, ConfigLocation, Dashboard, MachineNameSource, TailscaleDiscovery};
+    use super::{
+        Config, ConfigLocation, Dashboard, MachineNameSource, MachineTransport, TailscaleDiscovery,
+    };
     use crate::daemon::web::DEFAULT_PORT;
     use crate::power::SleepPolicy;
 
@@ -1262,8 +1469,18 @@ address = "http://training:7677"
             settings.discovery.tailscale,
             Some(TailscaleDiscovery { port: DEFAULT_PORT })
         );
-        let machines: Vec<String> = settings.machines.iter().map(ToString::to_string).collect();
+        let machines: Vec<String> = settings
+            .machines
+            .iter()
+            .filter_map(|machine| machine.http_address().map(ToString::to_string))
+            .collect();
         assert_eq!(machines, vec!["http://main:7677", "http://training:7677"]);
+        assert!(
+            settings
+                .machines
+                .iter()
+                .all(|machine| machine.transports().len() == 1)
+        );
         assert_eq!(config.machine_name().1, MachineNameSource::Configured);
     }
 
@@ -1282,6 +1499,94 @@ address = "http://training:7677"
         assert!(err.contains("http://"), "{err}");
         let err = Config::parse("[fleet.discovery]\ntailscale_port = 7000\n").unwrap_err();
         assert!(err.contains("requires tailscale"), "{err}");
+    }
+
+    #[test]
+    fn fleet_machines_list_transports_in_order_and_refuse_unused_addresses() {
+        let id = iroh::SecretKey::generate().public();
+        let other = iroh::SecretKey::generate().public();
+        let parse = |machine: &str, iroh: &str| {
+            Config::parse(&format!(
+                "[fleet]\nenabled = true\n{iroh}\n[[fleet.machines]]\n{machine}\n"
+            ))
+        };
+        let link = "[fleet.iroh]\nrelays = \"n0\"";
+        let kinds = |config: &Config| -> Vec<&'static str> {
+            config.fleet_settings().unwrap().machines[0]
+                .transports()
+                .iter()
+                .map(|transport| match transport {
+                    MachineTransport::Http(_) => "http",
+                    MachineTransport::Iroh(_) => "iroh",
+                })
+                .collect()
+        };
+
+        // both given and no list: HTTP first, the first rollout stage
+        let both = format!("address = \"http://main:7677\"\niroh = \"{id}\"");
+        assert_eq!(kinds(&parse(&both, link).unwrap()), ["http", "iroh"]);
+        let first = format!("{both}\ntransports = [\"iroh\", \"http\"]");
+        assert_eq!(kinds(&parse(&first, link).unwrap()), ["iroh", "http"]);
+        let only = format!("iroh = \"{id}\"");
+        let config = parse(&only, link).unwrap();
+        assert_eq!(kinds(&config), ["iroh"]);
+        assert_eq!(
+            config.fleet_settings().unwrap().machines[0].http_address(),
+            None
+        );
+
+        // the declared id and the extra peers are both allowed
+        let peers = format!("[fleet.iroh]\npeers = [\"{other}\"]");
+        let config = parse(&only, &peers).unwrap();
+        assert_eq!(
+            config.fleet_settings().unwrap().link_peers(),
+            BTreeSet::from([id, other])
+        );
+
+        let refused = [
+            (
+                format!("{both}\ntransports = [\"iroh\"]"),
+                "leaves out http",
+            ),
+            (format!("{both}\ntransports = []"), "leaves out http"),
+            (
+                format!("{both}\ntransports = [\"iroh\", \"iroh\", \"http\"]"),
+                "more than once",
+            ),
+            (
+                "address = \"http://main:7677\"\ntransports = [\"iroh\"]".into(),
+                "iroh is not set",
+            ),
+            ("iroh_addrs = [\"10.0.0.2:7679\"]".into(), "need iroh"),
+            (String::new(), "needs an address"),
+            (format!("{only}\ntransports = [\"tcp\"]"), "unknown variant"),
+        ];
+        for (machine, message) in refused {
+            let err = parse(&machine, link).unwrap_err();
+            assert!(err.contains(message), "{machine}: {err}");
+        }
+        let err = parse(&only, "").unwrap_err();
+        assert!(err.contains("needs [fleet.iroh]"), "{err}");
+        // only n0 finds an endpoint by its id alone
+        let direct = "[fleet.iroh]\nrelays = \"disabled\"";
+        let err = parse(&only, direct).unwrap_err();
+        assert!(err.contains("iroh_addrs"), "{err}");
+        // with relays off a relay url alone is never dialed
+        let relayed = format!("{only}\niroh_relay = \"https://relay.example.com\"");
+        let err = parse(&relayed, direct).unwrap_err();
+        assert!(err.contains("set iroh_addrs"), "{err}");
+        let custom = "[fleet.iroh]\nrelays = [\"https://relay.example.com\"]";
+        parse(&relayed, custom).unwrap();
+        let addressed = format!("{only}\niroh_addrs = [\"10.0.0.2:7679\"]");
+        let config = parse(&addressed, direct).unwrap();
+        let endpoint = config.fleet_settings().unwrap().machines[0].iroh().unwrap();
+        assert_eq!(endpoint.addrs, vec!["10.0.0.2:7679".parse().unwrap()]);
+
+        let twice = format!(
+            "[fleet]\nenabled = true\n{link}\n[[fleet.machines]]\n{only}\n[[fleet.machines]]\n{only}\n"
+        );
+        let err = Config::parse(&twice).unwrap_err();
+        assert!(err.contains("more than once"), "{err}");
     }
 
     #[test]

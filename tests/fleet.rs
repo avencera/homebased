@@ -538,6 +538,8 @@ mod fake_cloudlease;
 mod fake_t3;
 #[path = "fleet/inspection.rs"]
 mod inspection;
+#[path = "fleet/link.rs"]
+mod link;
 #[path = "fleet/machine_wait.rs"]
 mod machine_wait;
 #[path = "fleet/messages.rs"]

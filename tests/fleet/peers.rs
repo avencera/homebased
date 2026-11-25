@@ -1,7 +1,7 @@
 //! Peer identity, discovery, configuration, and cluster reads
 
 use super::{Daemon, wait_for_probe, wait_until};
-use homebased::config::{Discovery, FleetSettings};
+use homebased::config::{Discovery, FleetMachine, FleetSettings};
 use homebased::fleet::address::MachineAddress;
 use homebased::fleet::directory::LocalMachine;
 use homebased::fleet::http::ClusterClient;
@@ -47,9 +47,10 @@ impl Observer {
                     mdns,
                     tailscale: None,
                 },
-                machines: configured,
+                machines: configured.into_iter().map(FleetMachine::http).collect(),
                 iroh: None,
             },
+            link_forwarders: Default::default(),
             listener: None,
             peers_path: dir.path().join("fleet-peers.json"),
             dashboard_url: None,
@@ -231,7 +232,10 @@ fn config_validate_reports_fleet_and_rejects_bad_files() {
     assert_eq!(body["source"], "explicit");
     assert_eq!(body["machine_name"], "code");
     assert_eq!(body["fleet"]["state"], "enabled");
-    assert_eq!(body["fleet"]["machines"][0], "http://main:7677");
+    assert_eq!(
+        body["fleet"]["machines"][0]["transports"],
+        serde_json::json!([{"transport": "http", "address": "http://main:7677"}])
+    );
 
     fs::write(&path, "[fleet]\nenabled = yes\n").unwrap();
     let (code, body) = validate(&path);

@@ -36,11 +36,11 @@ uses `7677`. The listener accepts single-label LAN names, `.local` names,
 `.ts.net` names, LAN or tailnet IP addresses, and its bind IP in the HTTP
 `Host` header. It rejects other public DNS names.
 
-Every Fleet machine needs a reachable `HOMEBASED_WEB_LISTEN` address. This
-HTTP listener serves Fleet requests and the optional dashboard. Fleet has no
-authentication. A reachable peer can use Fleet routes and the dashboard file
-browser, so use a trusted LAN or tailnet. The daemon still works for local
-tasks when Fleet is disabled or its TCP listener is off.
+Every Fleet machine needs an `HOMEBASED_WEB_LISTEN` address. This HTTP
+listener serves Fleet requests and the optional dashboard. Plain Fleet HTTP has
+no authentication. A reachable peer can use Fleet routes and the dashboard file
+browser, so use a trusted LAN or tailnet, or the iroh link below. The daemon
+still works for local tasks when Fleet is disabled or its TCP listener is off.
 
 Validate config and load changes with a daemon restart:
 
@@ -52,6 +52,49 @@ homebased daemon restart
 `config validate --json` prints the chosen path, whether the file exists, the
 machine-name source, and the effective Fleet settings. It exits with
 `config_invalid` when an explicit file is missing or the TOML is not valid.
+
+## iroh link
+
+A machine with `[fleet.iroh]` runs an iroh endpoint that authenticates peers
+by endpoint id. A `[[fleet.machines]]` entry names a peer's id with `iroh`,
+and the order to try HTTP and the link with `transports`:
+
+```toml
+[fleet.iroh]
+relays = "n0"                 # or ["https://relay.example.com"], or "disabled"
+port = 7679                   # UDP
+peers = ["<endpoint id>"]     # optional: more ids allowed the whole Fleet API
+
+[[fleet.machines]]
+address = "http://main:7677"
+iroh = "<main's endpoint id>"
+transports = ["http", "iroh"] # omitted: the transports the entry has, HTTP first
+# iroh_addrs = ["192.168.1.10:7679"]        # needed unless relays = "n0"
+# iroh_relay = "https://relay.example.com"  # or this, with custom relays
+```
+
+- `homebased --json fleet endpoint-id` prints this installation's id. It reads
+  the state directory, works with the daemon down, and makes the key on first
+  use.
+- Every listed `transports` entry needs its key (`address` or `iroh`), and every
+  key needs its transport listed. `config validate` refuses anything else.
+- An entry's `iroh` id is granted the whole Fleet API; `peers` adds ids this
+  daemon does not dial. Every other id is refused. List each peer on both
+  sides so events come back over the link.
+- An entry without `http` is link-only: that peer is never reached at an HTTP
+  address, even a discovered one, once a link probe has confirmed its id
+  (`iroh` in `fleet machines`). Confirm it with both transports listed before
+  dropping `http`.
+- To turn HTTP off on a machine whose peers all reach it over the link, set
+  `HOMEBASED_WEB_LISTEN=127.0.0.1:7677`, not `off`: link streams are handed to
+  that listener. The CLI uses the Unix socket either way.
+- `fleet machines` shows `local.iroh` (own id, relays, each allowed id with its
+  grant and connection), each peer's link-confirmed `iroh` id, and an `iroh` id
+  on each link address. A pair keeps one connection; `dialed_by` and `since`
+  stay put once it settles.
+
+Changing `[fleet.iroh]` or `[[fleet.machines]]` needs a daemon restart, like
+any config change.
 
 The config file is the source for configured addresses. Fleet UUIDs, cached
 discovery data, and addresses added by `fleet add` are stored in Homebased
@@ -110,5 +153,5 @@ Machines must run the same homebased version to see held tasks across the
 Fleet. Until an older machine updates, it reports a newer peer that has held
 tasks as unavailable.
 
-The Fleet protocol uses plain HTTP and has no authentication. Do not route it
-over a network that you do not trust.
+Plain Fleet HTTP has no authentication. Do not route it over a network that
+you do not trust; use the iroh link there.

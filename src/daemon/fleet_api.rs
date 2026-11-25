@@ -10,6 +10,7 @@ use tokio::task::JoinSet;
 use crate::daemon::AppState;
 use crate::daemon::actors::{StoreMsg, call};
 use crate::daemon::cluster::{ExecutionBody, ExecutionView};
+use crate::daemon::fleet_link::LinkPeerView;
 use crate::domain::{API_VERSION, TaskId};
 use crate::error::AppError;
 use crate::events::{EventRouteStatus, FailedInboxEvent};
@@ -33,6 +34,21 @@ pub struct LocalView {
     pub advertised: Vec<MachineAddress>,
     /// Whether another daemon claims this installation UUID.
     pub identity: LocalIdentityStatus,
+    /// This daemon's end of the iroh Fleet link, when `[fleet.iroh]` is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iroh: Option<LocalLinkView>,
+}
+
+/// This daemon's end of the iroh Fleet link.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalLinkView {
+    /// Its endpoint id, which peers list to allow it.
+    pub endpoint: iroh::EndpointId,
+    /// Relays it uses.
+    pub relays: crate::fleet::iroh::Relays,
+    /// Endpoint ids it serves, and the connection to each.
+    pub peers: Vec<LinkPeerView>,
 }
 
 /// Fleet inventory, including last-known offline peers.
@@ -222,6 +238,11 @@ async fn inventory(state: &AppState) -> MachinesBody {
             name: state.machine.name.clone(),
             advertised,
             identity,
+            iroh: state.fleet_link.as_ref().map(|link| LocalLinkView {
+                endpoint: link.id(),
+                relays: link.relays(),
+                peers: link.peers(),
+            }),
         },
         machines,
         unresolved,

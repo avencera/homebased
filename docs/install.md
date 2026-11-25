@@ -77,7 +77,7 @@ Use `homebased daemon stop` and `homebased daemon restart`. Do not use raw `syst
 
 ## Listener for Fleet and the dashboard
 
-To let other Fleet machines reach this daemon, set `HOMEBASED_WEB_LISTEN` to a reachable host:port before install. The host unit stores this address, and a later install from a shell without the variable keeps it; set it to `off` to turn the listener off. Use a Tailscale or LAN address on a trusted network, or `0.0.0.0:7677` to listen on all interfaces. You can also set `--web-listen` when you run the daemon directly. A loopback address cannot receive requests from other machines.
+To let other Fleet machines reach this daemon, set `HOMEBASED_WEB_LISTEN` to a reachable host:port before install. The host unit stores this address, and a later install from a shell without the variable keeps it; set it to `off` to turn the listener off. Use a Tailscale or LAN address on a trusted network, or `0.0.0.0:7677` to listen on all interfaces. You can also set `--web-listen` when you run the daemon directly. A loopback address cannot receive requests from other machines, except over the [iroh link](fleet.md#http-off), which hands its peers' requests to this listener.
 
 The HTTP listener is off by default. Fleet peers use this listener. The dashboard is also served here when its assets are built. There is no application token: any peer that can reach the listener can use Fleet routes and can read every regular file available to the daemon user through the dashboard file browser. Text, raster images, and HTML open on a separate content origin; other files download.
 

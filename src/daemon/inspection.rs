@@ -831,8 +831,11 @@ async fn origin_address_hints(
         .into_iter()
         .find(|peer| peer.machine == executor)
         .map_or_else(Vec::new, |peer| {
+            // a link address is the origin's own loopback forwarder, which
+            // means nothing on this machine
             peer.addresses
                 .into_iter()
+                .filter(|ranked| ranked.iroh.is_none())
                 .map(|ranked| ranked.address)
                 .collect()
         })
