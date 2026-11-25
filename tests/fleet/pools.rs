@@ -1195,6 +1195,26 @@ fn a_released_pool_leaves_later_jobs_of_its_class_to_the_fleet() {
     // the coordinator now offers the class itself, as a permanent Fleet
     // machine would, so a new job waits for its slot and runs there
     cli(&origin, thread, &["ci", "capacity", "shared", "1"]);
+    // a pool may not share its class with a Fleet machine
+    let refused = cli_output(
+        &origin,
+        thread,
+        &[
+            "pool",
+            "create",
+            "shared",
+            "--machine-class",
+            "do-c16",
+            "--max",
+            "1",
+            "--deadline",
+            "1h",
+        ],
+    );
+    assert!(!refused.status.success());
+    let refusal = String::from_utf8_lossy(&refused.stderr).into_owned()
+        + &String::from_utf8_lossy(&refused.stdout);
+    assert!(refusal.contains("class_offered"), "{refusal}");
     let after = accepted(ci_run(
         &origin,
         thread,

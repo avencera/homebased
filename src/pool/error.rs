@@ -10,6 +10,8 @@ pub enum PoolCode {
     PoolsNotConfigured,
     /// A pool of that name is open or releasing
     PoolExists,
+    /// A Fleet machine already offers the CI class the pool would name
+    ClassOffered,
     /// No pool of that name
     PoolNotFound,
     /// The pool takes no more jobs or machines
@@ -33,6 +35,7 @@ impl PoolCode {
         match self {
             Self::PoolsNotConfigured => "pools_not_configured",
             Self::PoolExists => "pool_exists",
+            Self::ClassOffered => "class_offered",
             Self::PoolNotFound => "pool_not_found",
             Self::PoolEnded => "pool_ended",
             Self::PoolDeadlineTooClose => "pool_deadline_too_close",
@@ -53,7 +56,7 @@ impl PoolCode {
             | Self::SubmodulesUnsupported
             | Self::BundleTooLarge => 2,
             Self::PoolNotFound => 3,
-            Self::PoolExists | Self::PoolEnded | Self::JoinRefused => 5,
+            Self::PoolExists | Self::ClassOffered | Self::PoolEnded | Self::JoinRefused => 5,
         }
     }
 }

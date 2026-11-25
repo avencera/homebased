@@ -52,7 +52,7 @@ homebased pool release afv
 
 The pool's name is the CI class its jobs name. A job of an open pool's class is accepted even before any machine exists. Submit pool jobs on the coordinator: only it reaches pool machines, and it counts only its own waiting jobs when it asks for machines.
 
-A pool owns its class until it is released: when it ends, it fails the class's jobs that never got a machine, even if a Fleet machine also offers the class. Once it is released the class is the Fleet's again: a job submitted then is accepted only if a Fleet machine offers the class, waits for that machine's slot, and the released pool never ends it.
+A pool owns its class until it is released: when it ends, it fails the class's jobs that never got a machine. So `pool create` refuses, with `class_offered` (exit 5), a name that a Fleet machine already offers as a CI class. Do not give a Fleet machine an open pool's class: the coordinator does not refuse that, and the pool still fails the class's waiting jobs when it ends. Once a pool is released the class is the Fleet's again: a job submitted then is accepted only if a Fleet machine offers the class, waits for that machine's slot, and the released pool never ends it.
 
 Placement never sends a job to a machine that cloudlease will delete before the job's kill limit, and every machine of the pool ends by its deadline, or sooner when the cloudlease class has a shorter lifetime. So the coordinator keeps each job within reach of some machine:
 

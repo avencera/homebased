@@ -25,6 +25,7 @@ use super::AppState;
 use super::actors::{StoreMsg, call};
 use super::dependencies::held_ci_routes;
 use super::fleet_link::{FleetLink, Grant, LinkPeer};
+use super::fleet_view::Scope;
 use crate::config::PoolsConfig;
 use crate::domain::API_VERSION;
 use crate::error::AppError;
@@ -41,7 +42,7 @@ use crate::pool::{
     PoolView, ReleaseReason, Rerun, RerunPolicy, RunEndCause, SlotId, parse_env_file,
 };
 use crate::queue::ci::{CiSpec, SlotCapacity};
-use crate::queue::delivery::{HeldJobEnding, JobRoute};
+use crate::queue::delivery::HeldJobEnding;
 use crate::store::PoolInsert;
 
 /// Socket routes that change pools: create and release
@@ -228,6 +229,7 @@ async fn create(
         });
     }
     let pool = body.into_pool()?;
+    refuse_fleet_class(&state, &pool.name).await?;
     let inserted = call(&state.store, |reply| StoreMsg::InsertPool {
         pool: Box::new(pool),
         reply,
@@ -252,6 +254,33 @@ async fn create(
         pool,
         machines: Vec::new(),
     })?))
+}
+
+/// Refuse a pool whose class a Fleet machine already offers
+///
+/// An open pool owns its class: it asks for machines for every waiting job
+/// of the class and fails those still waiting when it ends, so it must not
+/// share the class with a Fleet machine. A Fleet machine that starts
+/// offering the class while the pool is open is not refused, since its
+/// offer is its own config: the pool keeps the class until it is released
+async fn refuse_fleet_class(state: &AppState, name: &PoolName) -> Result<(), AppError> {
+    let (_, statuses) = super::ci_api::fleet_status(state, Scope::All).await?;
+    let offered = statuses.iter().any(|status| {
+        status
+            .offer
+            .class(name.class())
+            .is_some_and(|offer| offer.capacity.get() > 0)
+    });
+    if !offered {
+        return Ok(());
+    }
+    Err(PoolError::new(
+        PoolCode::ClassOffered,
+        format!(
+            "a Fleet machine already offers CI class {name} (see `ci slots`); name the pool after a class no Fleet machine offers"
+        ),
+    )
+    .into())
 }
 
 async fn list(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
@@ -616,13 +645,10 @@ pub(super) async fn run(state: AppState) {
                 client: &client,
                 config: &config,
             };
-            // a job whose machine refused it after the pool's last pass is held
-            // again with no pool left to place it, so a released pool keeps
-            // ending its held jobs; it needs no cloudlease call for that
-            if let PoolState::Released { end, .. } = &pool.state {
-                if let Err(error) = pass.end_held_jobs(&pool, end).await {
-                    warn!(pool = %name, "ending a released pool's held jobs: {error}");
-                }
+            // a released pool ended its held jobs as it wound down; a job of
+            // its class submitted since waits for a Fleet machine that
+            // offers the class, so it is not the pool's to end
+            if let PoolState::Released { .. } = &pool.state {
                 if let Err(error) = super::bundles::remove_if_released(&state, &name).await {
                     warn!(pool = %name, "removing a released pool's bundles: {error}");
                 }
@@ -1272,7 +1298,8 @@ impl Pass<'_> {
     /// End the pool's jobs that have not started and that no machine of the
     /// pool can run to their kill limit any more: time only takes reach away
     async fn end_out_of_reach(&self, pool: &Pool, reach: &PoolReach) -> Result<(), AppError> {
-        for route in self.owned_jobs(pool).await? {
+        let held = held_ci_routes(self.state, pool.name.class()).await?;
+        for route in held.ready.into_iter().chain(held.waiting) {
             let Some(kill) = route.spec.ci.as_ref().map(|ci| ci.kill_after.get()) else {
                 continue;
             };
@@ -1299,21 +1326,10 @@ impl Pass<'_> {
         Ok(())
     }
 
-    /// Held jobs of the pool's class that the pool owns, ready or not;
-    /// the class's other held jobs wait for a Fleet machine that offers it
-    async fn owned_jobs(&self, pool: &Pool) -> Result<Vec<JobRoute>, AppError> {
-        let held = held_ci_routes(self.state, pool.name.class()).await?;
-        Ok(held
-            .ready
-            .into_iter()
-            .chain(held.waiting)
-            .filter(|route| pool.owns(route.submitted_at))
-            .collect())
-    }
-
     /// End the pool's jobs that have not started, with why the pool ended
     async fn end_held_jobs(&self, pool: &Pool, end: &PoolEnd) -> Result<(), AppError> {
-        for route in self.owned_jobs(pool).await? {
+        let held = held_ci_routes(self.state, pool.name.class()).await?;
+        for route in held.ready.into_iter().chain(held.waiting) {
             let job = route.job;
             let ending = HeldJobEnding::Refused {
                 code: end.job_code().to_owned(),

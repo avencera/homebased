@@ -400,9 +400,6 @@ async fn submit(
             // a CI job waits on its origin until placement picks a machine,
             // and is refused now when no machine it may use offers its class
             let ci = body.spec.ci.is_some();
-            // taken before admission reads any pool, so a job a pool admitted
-            // reads as taken before that pool's release
-            let taken_at = chrono::Utc::now();
             if ci && body.placement.is_some() {
                 return Err(AppError::Usage {
                     message: "a CI job runs on CI slots, which have no queue order to place it in"
@@ -439,7 +436,7 @@ async fn submit(
                 },
                 after: body.after,
                 owes_final_event: held,
-                submitted_at: ci.then_some(taken_at),
+                submitted_at: ci.then(chrono::Utc::now),
                 placement: body.placement,
                 rerun: None,
                 cancel_requested: false,

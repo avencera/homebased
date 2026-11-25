@@ -125,9 +125,8 @@ pub(super) async fn check_offered(
         return Ok(());
     };
     // a pool's class is offered by machines it creates on demand. A pool
-    // that is not released owns its class: it fails the class's held jobs
-    // as it ends, so its refusal stands even if another machine offers it.
-    // Once released, the class is the Fleet's again
+    // that is not released owns its class, so its refusal stands even if a
+    // Fleet machine offers it. Once released, the class is the Fleet's again
     let pool = match choice {
         MachineChoice::Any => super::pools::admit_pool_job(state, ci).await?,
         MachineChoice::Pinned(machine) => {
