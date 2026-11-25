@@ -12,7 +12,6 @@ pub mod boot;
 pub mod bundle;
 pub mod cloudlease;
 pub mod error;
-pub mod notice;
 pub mod renewal;
 
 use std::fmt;
@@ -1042,10 +1041,6 @@ pub struct MachineLost {
     pub machine: MachineName,
     /// Why
     pub reason: ReleaseReason,
-    /// When the provider ends the machine, from its interruption notice; the
-    /// interrupted run may go on until then, beside the rerun
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ends_at: Option<DateTime<Utc>>,
     /// The run now queued: 2 for the first rerun
     pub attempt: u32,
     /// Runs the pool allows each job: its retries and the first run
@@ -1148,35 +1143,6 @@ pub struct JoinRequest {
     pub lease: LeaseId,
     /// The single-use token from its boot data
     pub join_token: JoinToken,
-}
-
-/// Body of `POST /v1/cluster/pool/notice`, sent by a temporary machine's
-/// daemon when its provider gave notice that it ends the machine soon, such
-/// as an AWS Spot interruption notice
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct InterruptionNotice {
-    /// Always 1
-    pub api_version: u32,
-    /// Pool the machine serves
-    pub pool: PoolName,
-    /// Its slot
-    pub slot: SlotId,
-    /// Its lease
-    pub lease: LeaseId,
-    /// What the provider does then, such as `terminate`
-    pub action: String,
-    /// When the provider ends the machine
-    pub ends_at: DateTime<Utc>,
-}
-
-/// Answer to an interruption notice
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NoticeAnswer {
-    /// Always 1
-    pub api_version: u32,
-    /// Jobs the coordinator queued again for other machines
-    pub queued: Vec<crate::queue::JobId>,
 }
 
 /// Answer to a join: everything the machine needs that boot data must not carry

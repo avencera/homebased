@@ -34,9 +34,9 @@ homebased --json pool release afv
 
 ## Interrupted machines
 
-When the provider takes a machine back (reason `interrupted`, such as an AWS Spot interruption), the coordinator queues its jobs again for another machine and the pool asks for a replacement; do nothing. Each rerun shows as `JOB_PREEMPTED` with `machine_lost` (`pool`, `machine`, `reason`, `attempt` now queued, `max_attempts`, and `ends_at` when the machine gave notice), a progress event that does not wake a sleeping thread. On AWS the machine reads the two-minute Spot notice, so the job is queued again within seconds; the interrupted run keeps going until AWS shuts the machine down, and can watch the file named by `HOMEBASED_INTERRUPTION_FILE` to save a checkpoint off the machine.
+When the provider takes a machine back (reason `interrupted`, such as an AWS Spot interruption), the coordinator queues its jobs again for another machine and the pool asks for a replacement; do nothing. Each rerun shows as `JOB_PREEMPTED` with `machine_lost` (`pool`, `machine`, `reason`, `attempt` now queued, `max_attempts`), a progress event that does not wake a sleeping thread. cloudlease notices an interrupted machine about a minute after the provider takes it, and the job is queued again then.
 
-So a job on such a pool must be safe to run again and to overlap a dying copy of itself for up to two minutes: derive output names from the input, upload each output whole (write, then rename or put at once), and skip work whose output exists.
+So a job on such a pool must be safe to run again: derive output names from the input, upload each output whole (write, then rename or put at once), and skip work whose output exists.
 
 A rerun ends with `JOB_FAILED` and `machine_released` with `not_rerun.cause`: `retries_exhausted` (it ran `max_attempts` times), `out_of_reach` (no machine could run it to its kill limit before the deadline), `pool_ended`, `pinned`, or `cancelled` (a cancel was asked for first). A replacement past the spend cap is refused, which stops the pool and fails the queued job with `spend_cap_reached` in `held_ending`. Report a job that kept getting interrupted to the user rather than resubmitting it in a loop. `heartbeat_lapsed` is never rerun, since a stalled job would stall again.
 

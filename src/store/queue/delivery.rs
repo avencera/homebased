@@ -434,7 +434,6 @@ impl Store {
                         pool: released.pool.clone(),
                         machine: released.machine.clone(),
                         reason: released.reason.clone(),
-                        ends_at: None,
                         attempt,
                         max_attempts: policy.max_attempts,
                     };
@@ -453,35 +452,6 @@ impl Store {
         })
     }
 
-    /// Queue one job this origin sent to `machine` again if `policy` lets
-    /// it run again, when the machine gave notice that its provider ends it
-    /// soon; whether it was queued
-    ///
-    /// The machine still runs, so a job that may not run again is left to
-    /// finish there or to end once cloudlease confirms the machine gone
-    pub fn rerun_job_of_ending_machine(
-        &self,
-        job: JobId,
-        machine: MachineId,
-        lost: &MachineLost,
-        policy: &RerunPolicy,
-    ) -> Result<bool, AppError> {
-        self.immediate(|| {
-            let Some(route) = self.unfinished_route_on(job, machine)? else {
-                return Ok(false);
-            };
-            let Rerun::Queue { attempt } = decide_rerun(policy, &lost.reason, &route) else {
-                return Ok(false);
-            };
-            let lost = MachineLost {
-                attempt,
-                ..lost.clone()
-            };
-            self.queue_again(route, lost)?;
-            Ok(true)
-        })
-    }
-
     /// The job's route while it was sent to `machine` and has no final event
     fn unfinished_route_on(
         &self,
@@ -489,7 +459,7 @@ impl Store {
         machine: MachineId,
     ) -> Result<Option<JobRoute>, AppError> {
         let route = self.job_route(job)?;
-        let open = self.unfinished_jobs_on(machine)?.contains(&job);
+        let open = self.jobs_on(machine, OnMachine::Sent)?.contains(&job);
         Ok(route.filter(|_| open))
     }
 
@@ -505,12 +475,6 @@ impl Store {
         }
         route.cancel_requested = true;
         self.save_route(&route)
-    }
-
-    /// Jobs this origin sent to `machine` that have no final event, oldest
-    /// first
-    pub fn unfinished_jobs_on(&self, machine: MachineId) -> Result<Vec<JobId>, AppError> {
-        self.jobs_on(machine, OnMachine::Sent)
     }
 
     /// Jobs this origin sent to `machine` or holds pinned to it that have no

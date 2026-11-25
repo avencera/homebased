@@ -5,7 +5,6 @@
 //! cloudlease confirms them gone
 
 use super::fake_cloudlease::{CLIENT_TOKEN, FakeCloudlease, FakeLease};
-use super::fake_imds::FakeImds;
 use super::{Daemon, register_thread, wait_until};
 use std::collections::BTreeMap;
 use std::fs;
@@ -59,9 +58,6 @@ fn coordinator(fake: &FakeCloudlease) -> Daemon {
 #[derive(Default)]
 struct Machines {
     daemons: BTreeMap<String, Daemon>,
-    /// Base of a fake metadata service each machine reads for a Spot
-    /// interruption notice, as on AWS; none on other providers
-    imds: Option<String>,
 }
 
 impl Machines {
@@ -72,7 +68,7 @@ impl Machines {
             if lease.state != "running" || self.daemons.contains_key(&lease.lease_id) {
                 continue;
             }
-            let daemon = boot(fake, &lease, self.imds.as_deref());
+            let daemon = boot(fake, &lease);
             self.daemons.insert(lease.lease_id.clone(), daemon);
         }
     }
@@ -102,22 +98,19 @@ impl Machines {
     }
 }
 
-fn boot(fake: &FakeCloudlease, lease: &FakeLease, imds: Option<&str>) -> Daemon {
+fn boot(fake: &FakeCloudlease, lease: &FakeLease) -> Daemon {
     let mut daemon = Daemon::start(&lease.hostname, true);
     let lease_file = daemon.home.parent().unwrap().join("lease.json");
-    let mut credential = json!({
+    // the deployed cloudlease Worker still writes `interruption_notice`,
+    // which a machine must ignore
+    let credential = json!({
         "lease_id": lease.lease_id,
         "token": lease.token,
         "api_base": fake.base(),
         "hard_deadline_at": lease.hard_deadline_at,
         "heartbeat_ttl_secs": 4,
+        "interruption_notice": "aws_imds",
     });
-    // cloudlease names the notice an AWS machine's provider gives
-    let mut temporary = String::new();
-    if let Some(base) = imds {
-        credential["interruption_notice"] = json!("aws_imds");
-        temporary = format!("\nimds_endpoint = \"{base}/{}\"", lease.hostname);
-    }
     fs::write(&lease_file, credential.to_string()).unwrap();
     let files = lease.boot["files"].as_array().unwrap();
     let config = files
@@ -129,7 +122,7 @@ fn boot(fake: &FakeCloudlease, lease: &FakeLease, imds: Option<&str>) -> Daemon 
         .replace(
             "lease_file = \"/etc/cloudlease/lease.json\"",
             &format!(
-                "lease_file = \"{}\"\nrenew_interval = \"1s\"\nlink_listen = \"127.0.0.1:0\"{temporary}",
+                "lease_file = \"{}\"\nrenew_interval = \"1s\"\nlink_listen = \"127.0.0.1:0\"",
                 lease_file.display()
             ),
         );
@@ -1494,7 +1487,6 @@ fn an_interrupted_job_runs_again_on_a_replacement_machine_and_succeeds() {
     assert_eq!(lost.reason.to_string(), "interrupted");
     assert_eq!(lost.machine.to_string(), first.hostname);
     assert_eq!((lost.attempt, lost.max_attempts), (2, 3));
-    assert_eq!(lost.ends_at, None);
     assert_eq!(fake.leases().len(), 2);
 }
 
@@ -1657,205 +1649,29 @@ fn a_rerun_the_spend_cap_refuses_a_machine_for_fails_with_the_pool() {
 }
 
 #[test]
-fn a_spot_notice_queues_the_job_again_before_cloudlease_notices_the_machine_gone() {
+fn a_job_cancelled_before_its_machine_is_interrupted_is_not_run_again() {
     let fake = FakeCloudlease::start(Duration::from_secs(4));
-    let imds = FakeImds::start();
-    let origin = coordinator(&fake);
-    let thread = thread(&origin);
-    create_pool(&origin, thread, "notice", &["--max", "2"]);
-    let starts = origin.user_home.join("starts");
-    let seen = origin.user_home.join("notice-file");
-    let script = format!(
-        "printf '%s\\n' \"$HOMEBASED_INTERRUPTION_FILE\" >> {}; {}",
-        seen.display(),
-        second_run_succeeds(&starts)
-    );
-    let job = run(&origin, thread, "notice", &script);
-
-    let mut machines = Machines {
-        imds: Some(imds.base().to_owned()),
-        ..Machines::default()
-    };
-    assert!(
-        machines.drive(&fake, Duration::from_secs(60), || lines(&starts) == 1
-            && imds.polls() > 0),
-        "the job never started or the machine never read its notice: {}",
-        pool(&origin, thread, "notice")
-    );
-    let first = live_lease(&fake).unwrap();
-    let ends_at = chrono::Utc::now() + chrono::Duration::minutes(2);
-    let noticed = std::time::Instant::now();
-    imds.interrupt(&first.hostname, ends_at);
-
-    // queued again on the notice, while cloudlease still holds the lease
-    let mut requeued = None;
-    assert!(
-        machines.drive(&fake, Duration::from_secs(30), || {
-            requeued = events(&origin, job)
-                .into_iter()
-                .find(|event| event.event == JobEventKind::JobPreempted);
-            requeued.is_some()
-        }),
-        "the notice never queued the job again: {}",
-        pool(&origin, thread, "notice")
-    );
-    assert!(noticed.elapsed() < Duration::from_secs(30));
-    let first_now = fake
-        .leases()
-        .into_iter()
-        .find(|lease| lease.lease_id == first.lease_id)
-        .unwrap();
-    assert_eq!(first_now.state, "running");
-    let lost = requeued.unwrap().machine_lost.unwrap();
-    assert_eq!(lost.reason.to_string(), "interrupted");
-    assert_eq!(lost.attempt, 2);
-    assert_eq!(
-        lost.ends_at.map(|at| at.timestamp()),
-        Some(ends_at.timestamp())
-    );
-
-    // the run on the ending machine found the notice where its variable said
-    let first_daemon = &machines.daemons[&first.lease_id];
-    let notice_path = first_daemon.home.join("temporary/interruption.json");
-    let written =
-        fs::read_to_string(fs::read_to_string(&seen).unwrap().lines().next().unwrap()).unwrap();
-    assert_eq!(
-        fs::read_to_string(&notice_path).unwrap(),
-        written,
-        "HOMEBASED_INTERRUPTION_FILE names the notice file"
-    );
-    let notice: Value = serde_json::from_str(&written).unwrap();
-    assert_eq!(notice["action"], "terminate");
-
-    // a second machine runs the job to its end
-    assert!(
-        machines.drive(&fake, Duration::from_secs(90), || final_event(&origin, job)
-            .is_some()),
-        "the rerun never ended: {}\n{:?}",
-        pool(&origin, thread, "notice"),
-        fake.leases()
-    );
-    assert_eq!(
-        final_event(&origin, job).unwrap().event,
-        JobEventKind::JobSucceeded
-    );
-    assert_eq!(lines(&starts), 2);
-
-    // when the provider ends the first machine, nothing more happens to the job
-    fake.end_lease(&first.lease_id, "interrupted");
-    assert!(
-        machines.drive(&fake, Duration::from_secs(30), || {
-            pool(&origin, thread, "notice")["machines"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|machine| {
-                    machine["name"] == first.hostname.as_str() && machine["state"] == "released"
-                })
-        }),
-        "the interrupted machine never left the pool"
-    );
-    let kinds: Vec<JobEventKind> = events(&origin, job)
-        .iter()
-        .map(|event| event.event)
-        .collect();
-    assert_eq!(
-        kinds,
-        [JobEventKind::JobPreempted, JobEventKind::JobSucceeded]
-    );
-}
-
-#[test]
-fn a_job_left_on_a_noticed_machine_still_reports_its_success() {
-    let fake = FakeCloudlease::start(Duration::from_secs(4));
-    let imds = FakeImds::start();
-    let origin = coordinator(&fake);
-    let thread = thread(&origin);
-    create_pool(
-        &origin,
-        thread,
-        "kept",
-        &["--max", "1", "--job-retries", "0"],
-    );
-    let started = origin.user_home.join("started");
-    let finish = origin.user_home.join("finish");
-    let script = format!(
-        "touch {}; while [ ! -e {} ]; do sleep 1; done",
-        started.display(),
-        finish.display()
-    );
-    let job = run(&origin, thread, "kept", &script);
-
-    let mut machines = Machines {
-        imds: Some(imds.base().to_owned()),
-        ..Machines::default()
-    };
-    assert!(
-        machines.drive(&fake, Duration::from_secs(60), || started.exists()
-            && imds.polls() > 0),
-        "the job never started: {}",
-        pool(&origin, thread, "kept")
-    );
-    let first = live_lease(&fake).unwrap();
-    imds.interrupt(
-        &first.hostname,
-        chrono::Utc::now() + chrono::Duration::minutes(2),
-    );
-
-    // the notice reaches the coordinator and a few reconcile passes go by
-    machines.drive(&fake, Duration::from_secs(20), || false);
-    assert!(
-        events(&origin, job).is_empty(),
-        "{:?}",
-        events(&origin, job)
-    );
-
-    // the run ends within AWS's two minutes and its success still arrives
-    fs::write(&finish, "").unwrap();
-    assert!(
-        machines.drive(&fake, Duration::from_secs(30), || final_event(&origin, job)
-            .is_some()),
-        "the job's end never reached its origin: {}",
-        pool(&origin, thread, "kept")
-    );
-    assert_eq!(
-        final_event(&origin, job).unwrap().event,
-        JobEventKind::JobSucceeded
-    );
-}
-
-#[test]
-fn a_job_cancelled_before_its_machine_is_noticed_is_not_run_again() {
-    let fake = FakeCloudlease::start(Duration::from_secs(4));
-    let imds = FakeImds::start();
     let origin = coordinator(&fake);
     let thread = thread(&origin);
     create_pool(&origin, thread, "cancel", &["--max", "2"]);
     let starts = origin.user_home.join("starts");
-    // the run takes its time to stop, so the notice lands mid-cancel
+    // the run takes its time to stop, so the interruption lands mid-cancel
     let script = format!(
-        "echo run >> {}; trap 'sleep 15; exit 0' TERM; while :; do sleep 1; done",
+        "echo run >> {}; trap 'sleep 30; exit 0' TERM; while :; do sleep 1; done",
         starts.display()
     );
     let job = run(&origin, thread, "cancel", &script);
 
-    let mut machines = Machines {
-        imds: Some(imds.base().to_owned()),
-        ..Machines::default()
-    };
+    let mut machines = Machines::default();
     assert!(
-        machines.drive(&fake, Duration::from_secs(60), || lines(&starts) == 1
-            && imds.polls() > 0),
+        machines.drive(&fake, Duration::from_secs(60), || lines(&starts) == 1),
         "the job never started: {}",
         pool(&origin, thread, "cancel")
     );
     let job_text = job.to_string();
     cli(&origin, thread, &["resource", "job", "cancel", &job_text]);
     let first = live_lease(&fake).unwrap();
-    imds.interrupt(
-        &first.hostname,
-        chrono::Utc::now() + chrono::Duration::minutes(2),
-    );
+    fake.end_lease(&first.lease_id, "interrupted");
 
     assert!(
         machines.drive(&fake, Duration::from_secs(60), || final_event(&origin, job)
@@ -1867,6 +1683,11 @@ fn a_job_cancelled_before_its_machine_is_noticed_is_not_run_again() {
         .iter()
         .map(|event| event.event)
         .collect();
-    assert_eq!(kinds, [JobEventKind::JobCancelled]);
+    assert_eq!(kinds, [JobEventKind::JobFailed]);
+    let released = final_event(&origin, job).unwrap().machine_released.unwrap();
+    assert_eq!(
+        serde_json::to_value(released.not_rerun).unwrap(),
+        json!({ "cause": "cancelled" })
+    );
     assert_eq!(lines(&starts), 1);
 }

@@ -198,7 +198,6 @@ impl Notifier {
             method: CurlMethod::Post,
             url: &url,
             bearer: token.as_deref(),
-            headers: &[],
             json_body: Some(&body),
             timeout: Duration::from_secs(30),
         })?;

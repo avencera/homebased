@@ -24,9 +24,6 @@ pub enum PoolCode {
     SubmodulesUnsupported,
     /// A pool job's commit makes a bundle larger than a machine takes
     BundleTooLarge,
-    /// A machine's interruption notice did not come from the joined machine
-    /// it names
-    NoticeRefused,
 }
 
 impl PoolCode {
@@ -43,7 +40,6 @@ impl PoolCode {
             Self::CommitUnavailable => "commit_unavailable",
             Self::SubmodulesUnsupported => "submodules_unsupported",
             Self::BundleTooLarge => "bundle_too_large",
-            Self::NoticeRefused => "notice_refused",
         }
     }
 
@@ -57,7 +53,7 @@ impl PoolCode {
             | Self::SubmodulesUnsupported
             | Self::BundleTooLarge => 2,
             Self::PoolNotFound => 3,
-            Self::PoolExists | Self::PoolEnded | Self::JoinRefused | Self::NoticeRefused => 5,
+            Self::PoolExists | Self::PoolEnded | Self::JoinRefused => 5,
         }
     }
 }

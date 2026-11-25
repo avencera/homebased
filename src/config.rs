@@ -166,9 +166,6 @@ pub struct TemporaryConfig {
     /// Time between renewal decisions
     #[serde(with = "humantime_serde")]
     pub renew_interval: std::time::Duration,
-    /// Base URL of EC2's instance metadata service, read for a Spot
-    /// interruption notice when `lease.json` says the provider gives one
-    pub imds_endpoint: String,
 }
 
 /// Host memory admission settings
@@ -523,8 +520,6 @@ struct RawTemporary {
     lease_file: Option<PathBuf>,
     #[serde(default)]
     renew_interval: Option<String>,
-    #[serde(default)]
-    imds_endpoint: Option<String>,
 }
 
 impl RawTemporary {
@@ -555,14 +550,6 @@ impl RawTemporary {
             // expects a renew every 30 seconds within it
             None => std::time::Duration::from_secs(30),
         };
-        let imds_endpoint = self
-            .imds_endpoint
-            .unwrap_or_else(|| crate::pool::notice::DEFAULT_IMDS_ENDPOINT.to_owned());
-        if !imds_endpoint.starts_with("http://") && !imds_endpoint.starts_with("https://") {
-            return Err(format!(
-                "temporary.imds_endpoint must be an http or https URL, got {imds_endpoint:?}"
-            ));
-        }
         Ok(TemporaryConfig {
             pool: self.pool,
             slot: self.slot,
@@ -575,7 +562,6 @@ impl RawTemporary {
             join_token: crate::pool::JoinToken::new(self.join_token),
             lease_file,
             renew_interval,
-            imds_endpoint,
         })
     }
 }

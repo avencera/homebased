@@ -35,11 +35,10 @@ use crate::pool::cloudlease::{
 };
 use crate::pool::{
     ComingSlots, DEFAULT_IDLE_LIMIT, DEFAULT_JOB_RETRIES, DEFAULT_MIN_FREE_DISK_GIB,
-    DEFAULT_STALL_AFTER, InterruptionNotice, JoinAnswer, JoinRequest, JoinToken, JoinedMachine,
-    MAX_JOB_RETRIES, MAX_LIFETIME, MAX_MACHINES, MachineClass, MachineLease, MachineLost,
-    MachineReleased, MachineState, NoticeAnswer, Pool, PoolCode, PoolEnd, PoolError, PoolMachine,
-    PoolName, PoolReach, PoolSettings, PoolState, PoolView, ReleaseReason, Rerun, RerunPolicy,
-    RunEndCause, SlotId, parse_env_file,
+    DEFAULT_STALL_AFTER, JoinAnswer, JoinRequest, JoinToken, JoinedMachine, MAX_JOB_RETRIES,
+    MAX_LIFETIME, MAX_MACHINES, MachineClass, MachineLease, MachineReleased, MachineState, Pool,
+    PoolCode, PoolEnd, PoolError, PoolMachine, PoolName, PoolReach, PoolSettings, PoolState,
+    PoolView, ReleaseReason, Rerun, RerunPolicy, RunEndCause, SlotId, parse_env_file,
 };
 use crate::queue::ci::{CiSpec, SlotCapacity};
 use crate::queue::delivery::{HeldJobEnding, JobRoute};
@@ -62,10 +61,6 @@ pub fn read_routes() -> Router<AppState> {
 /// Route a temporary machine joins through, over the Fleet link
 pub const JOIN_PATH: &str = "/v1/cluster/pool/join";
 
-/// Route a joined temporary machine reports its provider's interruption
-/// notice through, over the Fleet link
-pub const NOTICE_PATH: &str = "/v1/cluster/pool/notice";
-
 /// How long after its join a machine's slots count as coming even while it
 /// cannot yet say what it offers
 const JOIN_SETTLE: Duration = Duration::from_secs(120);
@@ -85,7 +80,6 @@ pub(super) fn enrollment_routes() -> Router<AppState> {
 /// other machines' tasks
 pub(super) fn member_routes(state: &AppState) -> Router<AppState> {
     let routes = enrollment_routes()
-        .route(NOTICE_PATH, post(notice))
         .route(
             "/v1/cluster/job-events",
             post(super::queue_api::member_job_event),
@@ -542,103 +536,6 @@ pub(super) async fn join(
         idle_limit: pool.settings.idle_limit,
         stall_after: pool.settings.stall_after,
         env,
-    }))
-}
-
-/// `POST /v1/cluster/pool/notice` over the Fleet link: a joined machine says
-/// its provider ends it soon, such as with an AWS Spot interruption notice
-///
-/// Its unfinished jobs that may run again are queued for other machines at
-/// once, rather than when cloudlease finds the machine gone a few minutes
-/// later, and the machine counts as releasing. Its lease is kept: the
-/// provider ends the machine at the notice's time, and until then a run may
-/// save what it can. A retry gets the same answer, with the jobs already
-/// queued left out
-pub(super) async fn notice(
-    State(state): State<AppState>,
-    Extension(peer): Extension<LinkPeer>,
-    Json(notice): Json<InterruptionNotice>,
-) -> Result<Json<NoticeAnswer>, AppError> {
-    configured(&state)?;
-    let refused =
-        |message: String| -> AppError { PoolError::new(PoolCode::NoticeRefused, message).into() };
-    if notice.api_version != API_VERSION {
-        return Err(refused(format!("api_version must be {API_VERSION}")));
-    }
-    let slot = notice.slot;
-    let _guard = state.locks.pool_joins.lock(slot).await;
-    let Some(mut machine) =
-        call(&state.store, |reply| StoreMsg::PoolMachine { slot, reply }).await?
-    else {
-        return Err(refused(format!("no pool machine {slot}")));
-    };
-    let (lease, joined) = match &machine.state {
-        MachineState::Joined { lease, joined }
-        | MachineState::Releasing {
-            lease,
-            joined: Some(joined),
-            ..
-        } if machine.pool == notice.pool
-            && lease.lease == notice.lease
-            && joined.endpoint == peer.endpoint =>
-        {
-            (lease.clone(), joined.clone())
-        }
-        _ => {
-            return Err(refused(format!(
-                "pool machine {slot} is not a joined machine of this notice's endpoint"
-            )));
-        }
-    };
-
-    let pool = read_pool(&state, &machine.pool).await?;
-    let policy = rerun_policy(&state, &pool, slot).await?;
-    let lost = MachineLost {
-        pool: pool.name.clone(),
-        machine: machine.name.clone(),
-        reason: ReleaseReason::Interrupted,
-        ends_at: Some(notice.ends_at),
-        // each job's own next attempt replaces this
-        attempt: 0,
-        max_attempts: policy.max_attempts,
-    };
-    let jobs = call(&state.store, |reply| StoreMsg::UnfinishedJobsOn {
-        machine: joined.machine,
-        reply,
-    })
-    .await?;
-    let unfinished = jobs.len();
-    let mut queued = Vec::new();
-    for job in jobs {
-        let _job_guard = state.locks.job_submissions.lock(job).await;
-        let rerun = call(&state.store, |reply| StoreMsg::RerunJobOfEndingMachine {
-            job,
-            machine: joined.machine,
-            lost: Box::new(lost.clone()),
-            policy,
-            reply,
-        })
-        .await?;
-        if rerun {
-            queued.push(job);
-        }
-    }
-
-    warn!(pool = %pool.name, machine = %machine.name, action = %notice.action, ends_at = %notice.ends_at, queued = queued.len(), unfinished, "temporary machine gave an interruption notice");
-    // a job left running there, such as one past its retry limit, may
-    // still finish before AWS takes the machine, so the machine keeps its
-    // link until cloudlease confirms it gone
-    if queued.len() == unfinished && matches!(machine.state, MachineState::Joined { .. }) {
-        machine.state = MachineState::Releasing {
-            lease,
-            joined: Some(joined),
-            reason: ReleaseReason::Interrupted,
-        };
-        save_machine(&state, &machine).await?;
-    }
-    Ok(Json(NoticeAnswer {
-        api_version: API_VERSION,
-        queued,
     }))
 }
 
