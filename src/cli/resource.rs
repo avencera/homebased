@@ -123,6 +123,12 @@ pub enum JobCommand {
         /// machine's memory bar (default 40 GiB)
         #[arg(long, value_name = "GIB")]
         mem_peak: Option<MemPeak>,
+        /// While the job is next in line for a busy resource, hold back from
+        /// tasks the part of its peak that the run it waits behind will not
+        /// free, as `hold_room` in the spec. Needs a peak. Tasks then get less
+        /// memory for as long as that run lasts
+        #[arg(long)]
+        hold_room: bool,
         /// Enter the queue at the front of the job's level instead of the back.
         /// Applies when the job enters the queue: at submit, or at release
         /// with `--after`
@@ -325,6 +331,7 @@ async fn run_job(ctx: &Ctx, client: &Client, command: JobCommand) -> Result<(), 
             allow_build,
             after,
             mem_peak,
+            hold_room,
             place_front,
             place_before,
             place_after,
@@ -345,6 +352,7 @@ async fn run_job(ctx: &Ctx, client: &Client, command: JobCommand) -> Result<(), 
                 allow_build,
                 placement,
                 mem_peak,
+                hold_room,
             };
             submit(ctx, client, job_id, &spec, flags, after).await
         }
@@ -446,6 +454,8 @@ pub(super) struct SubmitFlags {
     pub(super) placement: Option<EntryPlacement>,
     /// `--mem-peak`, which must agree with a `mem_peak` in the spec
     pub(super) mem_peak: Option<MemPeak>,
+    /// `--hold-room`, which sets `hold_room` in the spec
+    pub(super) hold_room: bool,
 }
 
 async fn submit(
@@ -497,6 +507,12 @@ pub(super) async fn submit_value(
     }
     if let Some(peak) = flags.mem_peak {
         set_mem_peak(&mut value, peak)?;
+    }
+    // a spec that is not an object fails its parse right after
+    if flags.hold_room
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert("hold_room".into(), json!(true));
     }
     let (spec, after) = JobSpec::parse_submission(&value)?;
     let after = merge_after(after, after_flags)?;
@@ -751,6 +767,9 @@ fn print_jobs(ctx: &Ctx, value: Value) -> Result<(), AppError> {
         println!("{id} {priority:<8} {position:<8} {state:<9} {target} / {name}");
         if let Some(wait) = list.memory_waits.get(&id) {
             println!("  {wait}");
+        }
+        if let Some(hold) = list.memory_holds.get(&id) {
+            println!("  {hold}");
         }
         if let Some(note) = list.lease_notes.get(&id) {
             for line in lease_note_lines(note, chrono::Utc::now()) {

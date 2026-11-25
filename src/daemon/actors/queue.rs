@@ -9,7 +9,7 @@ use ractor::{Actor, ActorProcessingErr, ActorRef};
 use tokio::task::AbortHandle;
 
 use crate::cleanup::{self, CleanupTiming, GroupOutcome, SweepOutcome};
-use crate::daemon::actors::memory::{Grant, MemoryMsg};
+use crate::daemon::actors::memory::{Grant, JobMemory, MemoryMsg};
 use crate::daemon::actors::supervisor::SupervisorMsg;
 use crate::daemon::actors::task::stop_run_task;
 use crate::daemon::actors::{StoreMsg, call};
@@ -216,7 +216,10 @@ async fn reconcile(myself: &ActorRef<QueueMsg>, state: &mut QueueState) -> Resul
         launched?;
     }
     args.memory.cast(MemoryMsg::JobsWaiting {
-        waits: memory_waits,
+        jobs: JobMemory {
+            waits: memory_waits,
+            holds: decisions.memory_holds.clone(),
+        },
     })?;
     if let Some(stop) = decisions.preemption {
         let committed = call(&args.store, |reply| StoreMsg::QueueStop {

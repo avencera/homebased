@@ -459,6 +459,7 @@ pub(super) fn job_view(job: &JobRecord) -> JobView {
             _ => QueuedState::Queued,
         },
         mem_peak: job.spec.mem_peak,
+        hold_room: job.spec.hold_room,
     }
 }
 

@@ -928,9 +928,12 @@ async fn execute_at(
     .await?;
     // the memory actor keeps why jobs wait for memory, so the store cannot list it
     if listing {
-        let waits = call(&state.memory, |reply| MemoryMsg::JobWaits { reply }).await?;
-        if !waits.is_empty() {
-            value["memory_waits"] = json!(waits);
+        let jobs = call(&state.memory, |reply| MemoryMsg::JobWaits { reply }).await?;
+        if !jobs.waits.is_empty() {
+            value["memory_waits"] = json!(jobs.waits);
+        }
+        if !jobs.holds.is_empty() {
+            value["memory_holds"] = json!(jobs.holds);
         }
     }
     Ok(value)

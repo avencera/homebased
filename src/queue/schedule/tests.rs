@@ -8,7 +8,7 @@ use super::{
 };
 use crate::cleanup::CleanupFailure as ProcessCleanupFailure;
 use crate::domain::TaskId;
-use crate::memory::{MemPeak, Room};
+use crate::memory::{MemPeak, MemoryHold, Room};
 use crate::queue::{
     ActiveRun, AttentionId, CleanupFailure, HOLD_AFTER, JobId, PreemptMode, PreemptRefusal,
     Preemption, Priority, ResourceId, ResourceName, RunNumber, RunPhase, StepIndex, StopCause,
@@ -74,6 +74,7 @@ impl Machine {
             preempt,
             state: QueuedState::Queued,
             mem_peak: None,
+            hold_room: false,
         });
         id
     }
@@ -96,9 +97,15 @@ impl Machine {
             preempt,
             state: QueuedState::Active(resource),
             mem_peak: None,
+            hold_room: false,
         });
         self.set_run(resource, job, task, phase);
         (job, task)
+    }
+
+    fn set_hold_room(&mut self, job: JobId) {
+        let view = self.queue.iter_mut().find(|view| view.id == job).unwrap();
+        view.hold_room = true;
     }
 
     fn set_peak(&mut self, job: JobId, gib: Option<f64>) {
@@ -540,6 +547,74 @@ fn a_job_behind_that_waits_for_memory_holds_back_no_preemption() {
         }]
     );
     assert_eq!(decisions.preemption, None);
+}
+
+#[test]
+fn the_job_next_for_a_busy_gpu_holds_what_the_run_ahead_will_not_free() {
+    const GIB: u64 = 1 << 30;
+    let hold = |peak: f64, held: u64| MemoryHold {
+        peak: MemPeak::from_gib(peak).unwrap(),
+        held: held * GIB,
+    };
+    // the 11-20 Vesuvius shape: a 28 GiB trace queued behind a 4 GiB predict
+    let mut machine = Machine::new(&["gpu0"]);
+    let (predict, _) = machine.running("gpu0", Priority::Medium, HELD, executing(t0()));
+    let trace = machine.queued(Priority::Medium, Target::Any, YIELD);
+    let next = machine.queued(Priority::Medium, Target::Any, YIELD);
+    machine.set_peak(predict, Some(4.0));
+    machine.set_peak(trace, Some(28.0));
+    machine.set_peak(next, Some(30.0));
+
+    // without hold_room a job keeps no room while its GPU is busy
+    assert!(decide(&machine.snapshot(t0())).memory_holds.is_empty());
+
+    // with it, the trace holds all but the predict's 4 GiB; the job behind
+    // the trace waits for it anyway, so holds nothing
+    machine.set_hold_room(trace);
+    machine.set_hold_room(next);
+    let decisions = decide(&machine.snapshot(t0()));
+    assert_eq!(
+        decisions.memory_holds.into_iter().collect::<Vec<_>>(),
+        [(trace, hold(28.0, 24))]
+    );
+
+    // a run without a peak frees an unknown amount, so the whole peak is held
+    machine.set_peak(predict, None);
+    let holds = decide(&machine.snapshot(t0())).memory_holds;
+    assert_eq!(holds.get(&trace), Some(&hold(28.0, 28)));
+
+    // a run that frees at least the peak leaves nothing to hold
+    machine.set_peak(predict, Some(28.0));
+    assert!(decide(&machine.snapshot(t0())).memory_holds.is_empty());
+}
+
+#[test]
+fn a_job_behind_a_launch_this_pass_holds_what_that_launch_will_not_free() {
+    const GIB: u64 = 1 << 30;
+    let mut machine = Machine::new(&["gpu0"]);
+    let gpu0 = machine.resource("gpu0");
+    let predict = machine.queued(Priority::Medium, Target::Any, YIELD);
+    let trace = machine.queued(Priority::Medium, Target::Pinned(gpu0), YIELD);
+    machine.set_peak(predict, Some(4.0));
+    machine.set_peak(trace, Some(28.0));
+    machine.set_hold_room(trace);
+    let snapshot = Snapshot {
+        memory: Some(Room::new(40 * GIB, 0, 0)),
+        ..machine.snapshot(t0())
+    };
+
+    let decisions = decide(&snapshot);
+    assert_eq!(
+        decisions.launches,
+        [Launch {
+            job: predict,
+            resource: gpu0
+        }]
+    );
+    assert_eq!(
+        decisions.memory_holds.get(&trace).map(|hold| hold.held),
+        Some(24 * GIB)
+    );
 }
 
 #[test]

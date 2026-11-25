@@ -15,8 +15,18 @@ cannot both start into the same room. Items wait in a fixed order: GPU queue job
 serving order, then tasks by `priority`, and in submit order within a level. A
 waiting item keeps its room, so smaller work behind it cannot start ahead of it
 and keep it waiting. A job whose GPU is busy keeps no room until the GPU is
-free. Work without `mem_peak` starts as before and is counted only through
-memory in use.
+free, unless it was submitted with `--hold-room` (`hold_room` in the spec):
+then, while no other job waits ahead of it for the same GPU, it holds back
+from tasks its peak less the peak of the job it waits behind, which that job
+frees when it ends. A trace of 28G queued behind a predict of 4G holds 24G, so
+tasks cannot take the memory the trace needs before the predict ends, at the
+cost of that room for as long as the predict runs. `resource jobs` prints
+`holding 24.0G of its 28.0G peak from tasks until its resource is free` under
+the job, and `--json` gives it under `memory_holds` by job id, with `peak` and
+`held` in bytes. A job ahead of it without `mem_peak` frees an unknown amount,
+so the whole peak is held. Work without `mem_peak` starts as before and is
+counted only through memory in use; set `require_peak` (below) on a machine
+whose GPU jobs must not lose memory to undeclared tasks.
 
 A task's `priority` is `high`, `medium` (the default), or `low`, set with
 `task run --priority` or `priority` in the spec, and needs `mem_peak`. Change

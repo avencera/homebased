@@ -10,10 +10,10 @@ use crate::domain::{API_VERSION, ProcessStatus, TaskEnv, TaskId};
 use crate::error::AppError;
 use crate::fleet::protocol::{
     ADMISSION_PROTOCOL, CI_PROTOCOL, CLUSTER_PROTOCOL_VERSION, ClusterProtocolVersion,
-    GPU_IDLE_PROTOCOL, PREEMPT_PROTOCOL, SUPPORTED_PROTOCOLS,
+    GPU_IDLE_PROTOCOL, HOLD_ROOM_PROTOCOL, PREEMPT_PROTOCOL, SUPPORTED_PROTOCOLS,
 };
 use crate::machine::MachineId;
-use crate::memory::{MemoryWait, Room};
+use crate::memory::{MemoryHold, MemoryWait, Room};
 use crate::queue::ci::{ClassOffer, Drain, JobClass, JobTiming, MachineOffer, SlotCapacity};
 use crate::queue::gpu::GpuUuid;
 use crate::queue::gpu_idle::{GpuIdleControl, GpuIdleDetail, GpuSummary};
@@ -169,11 +169,13 @@ impl QueueRequest {
 
 /// Lowest cluster protocol whose authorities accept `spec`
 ///
-/// An older authority refuses a spec with `mem_peak`, `hold`, `gpu_idle`, or
-/// `ci` as an unknown field
+/// An older authority refuses a spec with `hold_room`, `mem_peak`, `hold`,
+/// `gpu_idle`, or `ci` as an unknown field
 #[must_use]
 pub fn submit_protocol(spec: &JobSpec) -> ClusterProtocolVersion {
-    if spec.mem_peak.is_some() {
+    if spec.hold_room {
+        HOLD_ROOM_PROTOCOL
+    } else if spec.mem_peak.is_some() {
         ADMISSION_PROTOCOL
     } else if spec.preempt.hold {
         PREEMPT_PROTOCOL
@@ -193,12 +195,15 @@ pub fn submit_protocol(spec: &JobSpec) -> ClusterProtocolVersion {
 /// listing. Only the response changes; the stored spec and its digest stay as
 /// accepted, and reads never check the digest
 fn downgrade_specs(result: &mut Value, protocol: ClusterProtocolVersion) {
-    if protocol >= ADMISSION_PROTOCOL {
+    if protocol >= HOLD_ROOM_PROTOCOL {
         return;
     }
     let downgrade = |job: &mut Value| {
         if let Some(spec) = job.pointer_mut("/spec").and_then(Value::as_object_mut) {
-            spec.remove("mem_peak");
+            spec.remove("hold_room");
+            if protocol < ADMISSION_PROTOCOL {
+                spec.remove("mem_peak");
+            }
         }
         if protocol >= PREEMPT_PROTOCOL {
             return;
@@ -300,6 +305,10 @@ pub struct JobList {
     /// authority's memory gate adds these after the store read
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub memory_waits: BTreeMap<JobId, MemoryWait>,
+    /// The room each job next in line for a busy resource holds back from
+    /// tasks, for jobs submitted with `hold_room`
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub memory_holds: BTreeMap<JobId, MemoryHold>,
 }
 
 /// One machine's resources and non-terminal jobs from a single store read
@@ -318,6 +327,9 @@ pub struct QueueOverview {
     /// Why each job with a free resource waits for host memory
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub memory_waits: BTreeMap<JobId, MemoryWait>,
+    /// The room each job next in line for a busy resource holds back from tasks
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub memory_holds: BTreeMap<JobId, MemoryHold>,
 }
 
 /// One job with its active run, every attempt, and its events
@@ -414,6 +426,7 @@ impl Store {
                             .job_lease_notes(machine, jobs.iter().map(|job| job.id))?,
                         jobs,
                         memory_waits: BTreeMap::new(),
+                        memory_holds: BTreeMap::new(),
                     })?
                 }
                 QueueRequest::Overview => {
@@ -425,6 +438,7 @@ impl Store {
                             .job_lease_notes(machine, jobs.iter().map(|job| job.id))?,
                         jobs,
                         memory_waits: BTreeMap::new(),
+                        memory_holds: BTreeMap::new(),
                     })?
                 }
                 QueueRequest::Show { job } => {

@@ -9,10 +9,12 @@
 //! A task launch that timed out has not settled, so its grant lasts while the
 //! task is still held, until a later release attempt gets an answer
 //!
-//! The order is the GPU queue's serving order, then tasks by submit order. A
-//! GPU job that waits for memory reserves its peak for every task, and a task
-//! that waits reserves its peak for every later task. A job whose resources
-//! are busy reserves nothing, since it cannot start anyway
+//! The order is the GPU queue's serving order, then tasks by priority and
+//! submit order. A GPU job that waits for memory reserves its peak for every
+//! task, and a task that waits reserves its peak for every later task. A job
+//! whose resources are busy reserves nothing, since it cannot start anyway,
+//! unless it asked to hold room: then, next in line, it reserves the part of
+//! its peak that the job ahead of it will not free
 //!
 //! A started task keeps its whole peak until it ends, since a late phase may
 //! need it. When the part of one task's peak it has not allocated is alone what
@@ -30,7 +32,9 @@ use crate::daemon::actors::{StoreMsg, call, send_reply};
 use crate::domain::TaskId;
 use crate::error::AppError;
 use crate::machine::MachineId;
-use crate::memory::{Claim, ClaimOwner, Gauge, Gib, MemPeak, MemoryReview, MemoryWait, Room};
+use crate::memory::{
+    Claim, ClaimOwner, Gauge, Gib, MemPeak, MemoryHold, MemoryReview, MemoryWait, Room,
+};
 use crate::queue::JobId;
 use crate::spec::{NormalizedSpec, NormalizedWorkload};
 
@@ -162,8 +166,8 @@ pub(crate) enum MemoryMsg {
         held_back: u64,
         reply: RpcReplyPort<Result<Result<(), MemoryWait>, AppError>>,
     },
-    /// The queue pass's waiting jobs, which hold their peaks back from tasks
-    JobsWaiting { waits: BTreeMap<JobId, MemoryWait> },
+    /// The queue pass's waiting jobs, which hold room back from tasks
+    JobsWaiting { jobs: JobMemory },
     /// Grant the ready tasks that fit, in the given order, and record why the
     /// rest wait; replies with the granted tasks
     AdmitTasks {
@@ -172,15 +176,43 @@ pub(crate) enum MemoryMsg {
     },
     /// A granted launch ended: its claim is in the store, or it never started
     Settle { grant: Grant },
-    /// Why each GPU queue job waits, from the last queue pass
+    /// Why each GPU queue job waits, and the room jobs hold, from the last
+    /// queue pass
     JobWaits {
-        reply: RpcReplyPort<Result<BTreeMap<JobId, MemoryWait>, AppError>>,
+        reply: RpcReplyPort<Result<JobMemory, AppError>>,
     },
     /// Why a held task waits, from the last release pass
     TaskWait {
         task: TaskId,
         reply: RpcReplyPort<Result<Option<MemoryWait>, AppError>>,
     },
+}
+
+/// The room GPU queue jobs that have not started hold back from tasks
+#[derive(Debug, Clone, Default)]
+pub(crate) struct JobMemory {
+    /// Jobs with a free resource that wait for memory, which reserve their peaks
+    pub waits: BTreeMap<JobId, MemoryWait>,
+    /// Jobs next in line for a busy resource that asked to hold room
+    pub holds: BTreeMap<JobId, MemoryHold>,
+}
+
+impl JobMemory {
+    /// Bytes these jobs keep from every task
+    ///
+    /// An unreadable gauge already starts nothing, so its waits reserve
+    /// nothing extra
+    fn reserved(&self) -> u64 {
+        let waits: u64 = self
+            .waits
+            .values()
+            .map(|wait| match wait {
+                MemoryWait::Room { peak, .. } => peak.bytes(),
+                MemoryWait::Unreadable { .. } => 0,
+            })
+            .sum();
+        waits + self.holds.values().map(|hold| hold.held).sum::<u64>()
+    }
 }
 
 /// Fixed actor dependencies
@@ -200,7 +232,7 @@ pub(crate) struct MemoryActor;
 pub(crate) struct MemoryState {
     args: MemoryArgs,
     grants: HashMap<Grant, (MemPeak, Instant)>,
-    job_waits: BTreeMap<JobId, MemoryWait>,
+    jobs: JobMemory,
     task_waits: HashMap<TaskId, MemoryWait>,
     /// Since when each running task has alone kept the first waiting task,
     /// named here, out; a new first waiting task starts the time again
@@ -264,7 +296,7 @@ impl Actor for MemoryActor {
         Ok(MemoryState {
             args,
             grants: HashMap::new(),
-            job_waits: BTreeMap::new(),
+            jobs: JobMemory::default(),
             task_waits: HashMap::new(),
             blocking: HashMap::new(),
             reviewed: HashSet::new(),
@@ -289,14 +321,14 @@ impl Actor for MemoryActor {
             } => {
                 send_reply(reply, state.grant_job(job, peak, held_back).await);
             }
-            MemoryMsg::JobsWaiting { waits } => state.job_waits = waits,
+            MemoryMsg::JobsWaiting { jobs } => state.jobs = jobs,
             MemoryMsg::AdmitTasks { ready, reply } => {
                 send_reply(reply, state.admit_tasks(ready, Instant::now()).await);
             }
             MemoryMsg::Settle { grant } => {
                 state.grants.remove(&grant);
             }
-            MemoryMsg::JobWaits { reply } => send_reply(reply, Ok(state.job_waits.clone())),
+            MemoryMsg::JobWaits { reply } => send_reply(reply, Ok(state.jobs.clone())),
             MemoryMsg::TaskWait { task, reply } => {
                 send_reply(reply, Ok(state.task_waits.get(&task).cloned()));
             }
@@ -374,7 +406,7 @@ impl MemoryState {
         if !ready.is_empty() {
             let (mut room, held) = self.room().await?;
             holdings = held;
-            room.reserve(self.job_waits.values().map(reserved_bytes).sum());
+            room.reserve(self.jobs.reserved());
             for candidate in ready {
                 // a pending launch's grant is already in the room, and its
                 // retry needs no more
@@ -483,16 +515,6 @@ impl MemoryState {
                 Err(error) => warn!("memory review of task={task}: {error}"),
             }
         }
-    }
-}
-
-/// Room a waiting item holds back from the items behind it
-///
-/// An unreadable gauge already starts nothing, so it reserves nothing extra
-fn reserved_bytes(wait: &MemoryWait) -> u64 {
-    match wait {
-        MemoryWait::Room { peak, .. } => peak.bytes(),
-        MemoryWait::Unreadable { .. } => 0,
     }
 }
 

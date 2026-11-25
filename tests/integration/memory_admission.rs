@@ -196,6 +196,104 @@ fn memory_admission_serves_in_order_and_holds_room_for_started_and_waiting_work(
 }
 
 #[test]
+fn a_job_next_for_a_busy_gpu_holds_room_from_tasks_only_when_asked() {
+    let mut h = Harness::new();
+    let cgroup = FakeCgroup::new(&h);
+    with_memory_gate(&mut h, &cgroup, &[]);
+    let mut jobs = Jobs::new(&h);
+    let waits_for = |file: &str| format!("while [ ! -f {file} ]; do sleep 0.1; done");
+
+    // a 2 GiB predict holds gpu0
+    let predict = JobId::new();
+    jobs.submit_with(
+        predict,
+        &spec(&h, "medium", "restart", &waits_for("finish-predict")),
+        &["--mem-peak", "2"],
+    );
+    eventually("the predict never started", || {
+        job_state(&h, predict) == "active"
+    });
+
+    // an 8 GiB trace queued behind it without --hold-room keeps no room
+    let plain = JobId::new();
+    jobs.submit_with(
+        plain,
+        &spec(&h, "medium", "restart", "true"),
+        &["--mem-peak", "8"],
+    );
+    let early = h.submit(&peak_task(&h, "early", 3.0));
+    h.wait_status(&early, "running");
+    cli(&h, &["resource", "job", "cancel", &plain.to_string()]);
+    h.release_gate("early");
+    h.wait_status(&early, "succeeded");
+
+    // with it, the trace holds all but the predict's 2 GiB, so a 3 GiB task
+    // that fits the 8 GiB free waits for the trace instead
+    let trace = JobId::new();
+    jobs.submit_with(
+        trace,
+        &spec(&h, "medium", "restart", &waits_for("finish-trace")),
+        &["--mem-peak", "8", "--hold-room"],
+    );
+    eventually("the trace never held its room", || {
+        cli(&h, &["resource", "jobs"])["memory_holds"][trace.to_string()]["held"] == 6 * GIB
+    });
+    let human = h.cmd().args(["resource", "jobs"]).output().unwrap();
+    let human = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        human.contains("holding 6.0G of its 8.0G peak from tasks until its resource is free"),
+        "{human}"
+    );
+    let late = h.submit(&peak_task(&h, "late", 3.0));
+    eventually("the late task never reported its memory wait", || {
+        task(&h, &late)["memory_wait"]["reason"] == "room"
+    });
+    assert_eq!(task(&h, &late)["status"], "held");
+
+    // the predict ends and the trace takes its room; the trace's 8 GiB claim
+    // still leaves the task waiting until it ends too
+    fs::write(h.home.join("finish-predict"), "").unwrap();
+    eventually("the trace never started", || {
+        job_state(&h, trace) == "active"
+    });
+    assert_eq!(cli(&h, &["resource", "jobs"])["memory_holds"], Value::Null);
+    assert_eq!(task(&h, &late)["status"], "held");
+    fs::write(h.home.join("finish-trace"), "").unwrap();
+    h.wait_status(&late, "running");
+    h.release_gate("late");
+    h.wait_status(&late, "succeeded");
+}
+
+#[test]
+fn hold_room_without_a_peak_is_refused() {
+    let h = Harness::new();
+    let path = h.home.join("hold-room.json");
+    fs::write(
+        &path,
+        serde_json::to_vec(&spec(&h, "medium", "restart", "true")).unwrap(),
+    )
+    .unwrap();
+    let output = h
+        .cmd()
+        .args([
+            "--json",
+            "resource",
+            "job",
+            "submit",
+            "--hold-room",
+            "--job-id",
+        ])
+        .arg(JobId::new().to_string())
+        .arg("--spec")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("/hold_room"), "{stderr}");
+}
+
+#[test]
 fn a_peak_over_the_bar_is_refused_at_submit() {
     let mut h = Harness::new();
     let cgroup = FakeCgroup::new(&h);

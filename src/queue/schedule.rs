@@ -12,7 +12,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 
 use crate::domain::TaskId;
-use crate::memory::{MemPeak, MemoryWait, Room};
+use crate::memory::{MemPeak, MemoryHold, MemoryWait, Room};
 
 use super::{
     ActiveRun, AttentionId, JobId, PreemptRefusal, PreemptStop, Preemption, Priority, ResourceId,
@@ -54,6 +54,9 @@ pub struct JobView {
     pub state: QueuedState,
     /// Host memory its runs may use at their peak; `None` skips the memory check
     pub mem_peak: Option<MemPeak>,
+    /// Whether it holds room from tasks while next in line for a busy
+    /// resource; only a job with `mem_peak` has it set
+    pub hold_room: bool,
 }
 
 /// Notice thresholds from `[resource.notify_blocked_after]`
@@ -183,6 +186,9 @@ pub struct Decisions {
     /// Jobs that have a free resource but wait for host memory, each holding
     /// that resource and reserving its peak
     pub memory_waits: BTreeMap<JobId, MemoryWait>,
+    /// Jobs with `hold_room` next in line for busy resources, and the room
+    /// each holds back from tasks
+    pub memory_holds: BTreeMap<JobId, MemoryHold>,
 }
 
 /// Decide launches, at most one preemption, and the blocked head
@@ -208,6 +214,11 @@ pub struct Decisions {
 ///    from it. Otherwise the victim would lose its step while the GPU sits idle.
 ///    The lowest level goes first, then the cheapest stop, then the most recent
 ///    start. The first queued job remains the notice head
+/// 3. A job with `hold_room` whose resources are all busy, and that no job
+///    ahead of it waits for any of the same resources, holds back from tasks
+///    its peak less the least that one of those resources' jobs frees when
+///    it ends. It holds nothing from other GPU jobs, which are served first
+///    anyway
 #[must_use]
 pub fn decide(snapshot: &Snapshot) -> Decisions {
     let mut free: Vec<&ResourceView> = snapshot
@@ -223,6 +234,9 @@ pub fn decide(snapshot: &Snapshot) -> Decisions {
     let mut waiting: Vec<(&JobView, Room)> = Vec::new();
     let mut memory = room(snapshot);
     let mut memory_waits = BTreeMap::new();
+    // the jobs that took a free resource this pass, which a job waiting for
+    // it waits behind
+    let mut taken: Vec<(ResourceId, &JobView)> = Vec::new();
     for job in snapshot.queue.iter().filter(|job| startable(snapshot, job)) {
         let Some(index) = free
             .iter()
@@ -232,6 +246,7 @@ pub fn decide(snapshot: &Snapshot) -> Decisions {
             continue;
         };
         let resource = free.remove(index);
+        taken.push((resource.id, job));
         if let Some(peak) = job.mem_peak
             && let Err(wait) = memory.admit(peak)
         {
@@ -260,12 +275,75 @@ pub fn decide(snapshot: &Snapshot) -> Decisions {
     let blocked = waiting
         .first()
         .map(|(head, _)| blocked_head(snapshot, head, preemption.as_ref()));
+    let waiting: Vec<&JobView> = waiting.into_iter().map(|(job, _)| job).collect();
     Decisions {
         launches,
         preemption,
         blocked,
         memory_waits,
+        memory_holds: memory_holds(snapshot, &waiting, &taken),
     }
+}
+
+/// The room each `hold_room` job next in line for busy resources holds back
+/// from tasks
+///
+/// A job behind another that waits for any of the same resources holds
+/// nothing, since it cannot start before that one. A job ahead of it frees
+/// its own peak when it ends, so only the rest is held; the least any of the
+/// job's resources frees counts, as any of them may come free first, and a
+/// job without a peak, or a run whose job is gone, frees an unknown amount
+fn memory_holds(
+    snapshot: &Snapshot,
+    waiting: &[&JobView],
+    taken: &[(ResourceId, &JobView)],
+) -> BTreeMap<JobId, MemoryHold> {
+    let shares_resource = |left: &JobView, right: &JobView| {
+        snapshot
+            .resources
+            .iter()
+            .any(|resource| left.target.allows(resource.id) && right.target.allows(resource.id))
+    };
+    // what the job on a busy resource frees when it ends
+    let frees = |resource: &ResourceView| {
+        let job = resource.run.as_ref().map_or_else(
+            || {
+                taken
+                    .iter()
+                    .find(|(id, _)| *id == resource.id)
+                    .map(|(_, job)| job.id)
+            },
+            |run| Some(run.job),
+        );
+        job.and_then(|job| snapshot.queue.iter().find(|view| view.id == job))
+            .and_then(|view| view.mem_peak)
+            .map_or(0, MemPeak::bytes)
+    };
+
+    let mut holds = BTreeMap::new();
+    for (index, job) in waiting.iter().enumerate() {
+        let Some(peak) = job.mem_peak.filter(|_| job.hold_room) else {
+            continue;
+        };
+        if waiting[..index]
+            .iter()
+            .any(|ahead| shares_resource(ahead, job))
+        {
+            continue;
+        }
+        let freed = snapshot
+            .resources
+            .iter()
+            .filter(|resource| job.target.allows(resource.id))
+            .map(frees)
+            .min()
+            .unwrap_or(0);
+        let held = peak.bytes().saturating_sub(freed);
+        if held > 0 {
+            holds.insert(job.id, MemoryHold { peak, held });
+        }
+    }
+    holds
 }
 
 /// Stop `job`'s executing run by hand, whatever its preemption mode, so a

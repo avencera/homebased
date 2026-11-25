@@ -140,6 +140,11 @@ pub struct JobSpec {
     // left out when absent, so the digests of earlier specs do not change
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mem_peak: Option<MemPeak>,
+    /// Whether the job, next in line for a busy resource, holds back from
+    /// tasks the part of `mem_peak` that the run it waits behind will not free
+    // left out when false, so the digests of earlier specs do not change
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub hold_room: bool,
 }
 
 impl JobSpec {
@@ -271,7 +276,15 @@ impl JobSpec {
             gpu_idle,
             ci: wire.ci,
             mem_peak: wire.mem_peak,
+            hold_room: wire.hold_room,
         };
+        if spec.hold_room && spec.mem_peak.is_none() {
+            return Err(invalid(
+                "/hold_room",
+                json!(true),
+                "hold_room holds back the job's peak, so it needs mem_peak",
+            ));
+        }
         spec.check_ci()?;
         Ok(spec)
     }
@@ -473,6 +486,13 @@ struct JobSpecWire {
     /// (default 40 GiB). Omit for no memory check
     #[serde(default)]
     mem_peak: Option<MemPeak>,
+    /// While the job is next in line for a busy resource, hold back from
+    /// tasks the part of `mem_peak` that the run it waits behind will not
+    /// free, so tasks cannot take the memory it needs before that run ends.
+    /// Needs `mem_peak`. Default false: a job keeps no room until its
+    /// resource is free
+    #[serde(default)]
+    hold_room: bool,
 }
 
 fn gpu_idle_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {

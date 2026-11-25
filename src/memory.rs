@@ -183,6 +183,28 @@ impl fmt::Display for MemoryWait {
     }
 }
 
+/// Room a queued job holds back from tasks while the resources it waits for
+/// are busy, so tasks cannot take what it needs before the run ahead ends
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryHold {
+    /// The job's peak
+    pub peak: MemPeak,
+    /// Bytes held: the peak less what the job ahead of it frees when it ends
+    pub held: u64,
+}
+
+impl fmt::Display for MemoryHold {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "holding {} of its {} peak from tasks until its resource is free",
+            Gib(self.held),
+            self.peak
+        )
+    }
+}
+
 /// The room left under the bar, handed out in the caller's order
 ///
 /// An item that fits takes its peak. An item that does not fit reserves its
