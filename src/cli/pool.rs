@@ -58,6 +58,11 @@ pub enum PoolCommand {
         /// 25 or 12.50; cloudlease's own per-run cap when omitted
         #[arg(long = "spend-cap", value_parser = parse_dollars)]
         spend_cap: Option<NonZeroU32>,
+        /// Times a job whose machine was interrupted, such as by an AWS Spot
+        /// interruption, runs again on another machine of the pool (default
+        /// 2, at most 10); the job must be safe to run again
+        #[arg(long = "job-retries")]
+        job_retries: Option<u32>,
     },
     /// List pools with their machines
     List,
@@ -90,6 +95,7 @@ pub async fn run(ctx: &Ctx, command: PoolCommand) -> Result<ExitCode, AppError> 
             min_free_disk,
             env_file,
             spend_cap,
+            job_retries,
         } => {
             let env_file = env_file.map(std::path::absolute).transpose()?;
             let format = |duration: Option<Duration>| {
@@ -108,6 +114,7 @@ pub async fn run(ctx: &Ctx, command: PoolCommand) -> Result<ExitCode, AppError> 
                 "env_file": env_file,
                 "spend_cap_cents": spend_cap,
                 "min_free_disk_gib": min_free_disk,
+                "job_retries": job_retries,
             });
             client.post("/v1/pools", &body).await?
         }

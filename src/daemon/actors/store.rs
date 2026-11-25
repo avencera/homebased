@@ -190,6 +190,12 @@ pub(crate) enum StoreMsg {
         refusal: crate::queue::delivery::JobRefusal,
         reply: RpcReplyPort<Result<(), AppError>>,
     },
+    /// Record a cancel request for a job this origin sent
+    RequestJobCancel {
+        job: crate::queue::JobId,
+        authority: crate::machine::MachineId,
+        reply: RpcReplyPort<Result<(), AppError>>,
+    },
     /// End a held job before it joins the queue, with its terminal event
     EndHeldJob {
         job: crate::queue::JobId,
@@ -694,11 +700,34 @@ pub(crate) enum StoreMsg {
     TemporaryActivity {
         reply: RpcReplyPort<Result<crate::store::StoredActivity, AppError>>,
     },
-    /// End the unfinished jobs this origin sent to a machine cloudlease deleted
-    EndJobsOfReleasedMachine {
+    /// Jobs this origin sent to a machine that have no final event
+    UnfinishedJobsOn {
+        machine: MachineId,
+        reply: RpcReplyPort<Result<Vec<crate::queue::JobId>, AppError>>,
+    },
+    /// Jobs this origin sent to a machine or holds pinned to it that have no
+    /// final event
+    JobsOfReleasedMachine {
+        machine: MachineId,
+        reply: RpcReplyPort<Result<Vec<crate::queue::JobId>, AppError>>,
+    },
+    /// Rerun or end an unfinished job this origin sent to a machine
+    /// cloudlease deleted, or end one held pinned to it
+    EndJobOfReleasedMachine {
+        job: crate::queue::JobId,
         machine: MachineId,
         released: Box<crate::pool::MachineReleased>,
-        reply: RpcReplyPort<Result<Vec<crate::queue::JobId>, AppError>>,
+        policy: crate::pool::RerunPolicy,
+        reply: RpcReplyPort<Result<Option<crate::pool::Rerun>, AppError>>,
+    },
+    /// Queue again a job this origin sent to a machine that gave notice its
+    /// provider ends it
+    RerunJobOfEndingMachine {
+        job: crate::queue::JobId,
+        machine: MachineId,
+        lost: Box<crate::pool::MachineLost>,
+        policy: crate::pool::RerunPolicy,
+        reply: RpcReplyPort<Result<bool, AppError>>,
     },
     /// Save a new service
     InsertService {
@@ -1157,6 +1186,13 @@ impl Actor for StoreActor {
                 refusal,
                 reply,
             } => send_reply(reply, state.refuse_job(job, refusal)),
+            StoreMsg::RequestJobCancel {
+                job,
+                authority,
+                reply,
+            } => {
+                send_reply(reply, state.request_job_cancel(job, authority));
+            }
             StoreMsg::EndHeldJob { job, ending, reply } => {
                 send_reply(reply, state.end_held_job(job, ending));
             }
@@ -1541,13 +1577,31 @@ impl Actor for StoreActor {
                 send_reply(reply, state.update_pool_machine(&machine));
             }
             StoreMsg::TemporaryActivity { reply } => send_reply(reply, state.temporary_activity()),
-            StoreMsg::EndJobsOfReleasedMachine {
+            StoreMsg::UnfinishedJobsOn { machine, reply } => {
+                send_reply(reply, state.unfinished_jobs_on(machine));
+            }
+            StoreMsg::JobsOfReleasedMachine { machine, reply } => {
+                send_reply(reply, state.jobs_of_released_machine(machine));
+            }
+            StoreMsg::EndJobOfReleasedMachine {
+                job,
                 machine,
                 released,
+                policy,
                 reply,
             } => send_reply(
                 reply,
-                state.end_jobs_of_released_machine(machine, &released),
+                state.end_job_of_released_machine(job, machine, &released, &policy),
+            ),
+            StoreMsg::RerunJobOfEndingMachine {
+                job,
+                machine,
+                lost,
+                policy,
+                reply,
+            } => send_reply(
+                reply,
+                state.rerun_job_of_ending_machine(job, machine, &lost, &policy),
             ),
             StoreMsg::InsertService { service, reply } => {
                 send_reply(reply, state.insert_service(&service));

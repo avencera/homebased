@@ -1046,16 +1046,25 @@ impl ChildOomScore {
     }
 }
 
-/// Variables a temporary machine's coordinator handed it at join; none elsewhere
+/// Variables a temporary machine's coordinator handed it at join, and where
+/// a run finds its provider's interruption notice; none elsewhere
 fn pool_variables(home: &Home) -> Result<Vec<(String, String)>, AppError> {
     let text = match std::fs::read_to_string(home.pool_env_path()) {
         Ok(text) => text,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error.into()),
     };
-    crate::pool::parse_env_file(&text).map_err(|message| AppError::Internal {
-        message: format!("pool variables: {message}"),
-    })
+    let mut variables =
+        crate::pool::parse_env_file(&text).map_err(|message| AppError::Internal {
+            message: format!("pool variables: {message}"),
+        })?;
+    // a pool's own variables may not start with HOMEBASED_, so this never
+    // collides with one
+    variables.push((
+        "HOMEBASED_INTERRUPTION_FILE".to_owned(),
+        home.interruption_notice_path().display().to_string(),
+    ));
+    Ok(variables)
 }
 
 #[cfg(test)]

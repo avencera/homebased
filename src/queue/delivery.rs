@@ -183,6 +183,41 @@ pub struct JobRoute {
     /// the authority applies it only when it first stores the job
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement: Option<crate::queue::EntryPlacement>,
+    /// Set once the origin queued the job again after its temporary
+    /// machine was lost
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerun: Option<Rerun>,
+    /// Set when someone asked to cancel the job after it was sent, so
+    /// losing its machine before the cancel lands never runs it again
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cancel_requested: bool,
+}
+
+impl JobRoute {
+    /// Which run of the job this route sends: 1 until a lost machine made
+    /// the origin queue it again
+    #[must_use]
+    pub fn attempt(&self) -> u32 {
+        self.rerun.map_or(1, |rerun| rerun.attempt)
+    }
+
+    /// Origin inbox sequence after which the current run's events go
+    #[must_use]
+    pub fn seq_base(&self) -> u64 {
+        self.rerun.map_or(0, |rerun| rerun.seq_base)
+    }
+}
+
+/// A CI job its origin queued again after its temporary machine was lost
+///
+/// Every machine numbers its events for a job from 1, so the origin stores
+/// the events of the current run after those its earlier runs left
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Rerun {
+    /// The run now queued or running: 2 for the first rerun
+    pub attempt: u32,
+    /// Last origin inbox sequence before the current run's first event
+    pub seq_base: u64,
 }
 
 /// The authority's definite refusal of a submit

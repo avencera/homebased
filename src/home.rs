@@ -142,6 +142,14 @@ impl Home {
         self.root.join("temporary").join("env")
     }
 
+    /// Where a temporary machine writes its provider's notice that it ends
+    /// the machine soon; runs on the machine find this path in
+    /// `HOMEBASED_INTERRUPTION_FILE`, and the file appears only with a notice
+    #[must_use]
+    pub fn interruption_notice_path(&self) -> PathBuf {
+        self.root.join("temporary").join("interruption.json")
+    }
+
     /// `iroh/secret.key`: this daemon's iroh key for the Fleet link, made on
     /// first use and kept so its endpoint id survives restarts
     #[must_use]

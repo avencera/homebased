@@ -2313,6 +2313,8 @@ async fn notice_ends_during_callback_preparation() {
         owes_final_event: false,
         submitted_at: None,
         placement: None,
+        rerun: None,
+        cancel_requested: false,
     };
     f.store.insert_job_route(&route).unwrap();
     let notice = RoutedJobEvent {
@@ -2496,6 +2498,8 @@ async fn sleeping_thread_wakes_for_job_alerts_and_the_final_event_only() {
         owes_final_event: false,
         submitted_at: None,
         placement: None,
+        rerun: None,
+        cancel_requested: false,
     };
     f.store.insert_job_route(&route).unwrap();
     assert_eq!(

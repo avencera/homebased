@@ -42,6 +42,8 @@ fn route_for(thread: &str) -> JobRoute {
         owes_final_event: false,
         submitted_at: None,
         placement: None,
+        rerun: None,
+        cancel_requested: false,
     }
 }
 
@@ -67,6 +69,7 @@ fn event(route: &JobRoute, seq: u64) -> RoutedJobEvent {
             lease_idle: None,
             timeout: None,
             machine_released: None,
+            machine_lost: None,
         },
     }
 }
@@ -402,5 +405,36 @@ fn a_pool_ends_only_jobs_it_still_holds_and_a_closed_class_holds_a_job_again() {
         matches!(&ended.submission, JobSubmission::Ended { ending: HeldJobEnding::Refused { code, .. } } if code == "run_ended"),
         "{:?}",
         ended.submission
+    );
+}
+
+#[test]
+fn a_cancel_is_recorded_only_when_it_goes_to_the_jobs_authority() {
+    let dir = tempdir().unwrap();
+    let store = Store::open(&dir.path().join("db")).unwrap();
+    let saved = route();
+    store.insert_job_route(&saved).unwrap();
+
+    // a cancel sent to another machine cannot stop the job, so a rerun stays allowed
+    store
+        .request_job_cancel(saved.job, MachineId::new())
+        .unwrap();
+    assert!(
+        !store
+            .job_route(saved.job)
+            .unwrap()
+            .unwrap()
+            .cancel_requested
+    );
+
+    store
+        .request_job_cancel(saved.job, saved.authority)
+        .unwrap();
+    assert!(
+        store
+            .job_route(saved.job)
+            .unwrap()
+            .unwrap()
+            .cancel_requested
     );
 }

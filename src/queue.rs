@@ -1187,7 +1187,8 @@ pub enum JobEventKind {
     JobFailed,
     /// A cancel took effect
     JobCancelled,
-    /// A run stopped for higher-priority work and the job is queued again
+    /// A run stopped before it ended, for higher-priority work or because
+    /// its temporary machine was lost, and the job is queued again
     JobPreempted,
     /// Cleanup after this job's run entered `Attention`
     JobAttention,
@@ -1322,6 +1323,11 @@ pub struct JobEvent {
     // only an origin writes it, for its own route, so no peer ever reads it
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine_released: Option<crate::pool::MachineReleased>,
+    /// Present on the `JOB_PREEMPTED` the origin writes when it queued a CI
+    /// job again after its temporary machine was lost
+    // only an origin writes it, like `machine_released`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_lost: Option<crate::pool::MachineLost>,
 }
 
 #[cfg(test)]

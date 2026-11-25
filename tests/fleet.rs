@@ -534,6 +534,8 @@ mod dependencies;
 mod events;
 #[path = "support/fake_cloudlease.rs"]
 mod fake_cloudlease;
+#[path = "support/fake_imds.rs"]
+mod fake_imds;
 #[path = "support/fake_t3.rs"]
 mod fake_t3;
 #[path = "fleet/inspection.rs"]

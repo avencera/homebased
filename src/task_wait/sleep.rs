@@ -309,7 +309,13 @@ impl HeldEvent {
                     .map_or_else(|| run.resource.to_string(), ToString::to_string);
                 format!("run {} preempted on {resource}; requeued", run.run_number)
             }
-            (JobEventKind::JobPreempted, _, None) => "preempted; requeued".to_owned(),
+            (JobEventKind::JobPreempted, _, None) => match &event.machine_lost {
+                Some(lost) => format!(
+                    "machine {} {}; queued again as run {} of {}",
+                    lost.machine, lost.reason, lost.attempt, lost.max_attempts
+                ),
+                None => "preempted; requeued".to_owned(),
+            },
             _ => HeldKind::Job(event.event).to_string(),
         };
         Self {

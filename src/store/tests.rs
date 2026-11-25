@@ -1214,6 +1214,7 @@ fn a_pool_release_keeps_its_run_and_survives_a_stale_save() {
             min_free_disk_gib: 1,
             env_file: None,
             spend_cap_cents: None,
+            job_retries: crate::pool::DEFAULT_JOB_RETRIES,
         },
         run_request: uuid::Uuid::now_v7(),
         run: None,

@@ -7,8 +7,10 @@ use super::fmt_time;
 use crate::error::AppError;
 use crate::events::EventAcceptance;
 use crate::machine::MachineId;
-use crate::pool::MachineReleased;
-use crate::queue::delivery::{HeldJobEnding, JobRefusal, JobRoute, JobSubmission, RoutedJobEvent};
+use crate::pool::{MachineLost, MachineReleased, NotRerun, ReleaseReason, Rerun, RerunPolicy};
+use crate::queue::delivery::{
+    self, HeldJobEnding, JobRefusal, JobRoute, JobSubmission, RoutedJobEvent,
+};
 use crate::queue::spec::MachineSelector;
 use crate::queue::{JobEvent, JobEventKind, JobId, MoveRefusal, Priority, QueueError, Target};
 use crate::store::Store;
@@ -352,9 +354,13 @@ impl Store {
                 .job_route_cursors(job)?
                 .ok_or(QueueError::JobNotFound { job })?
                 .accepted;
-            if !applies || accepted != 0 {
+            // a held job has no events of its own yet; a rerun keeps those of
+            // its earlier runs, which end at its sequence base
+            if !applies || accepted != route.seq_base() {
                 return Ok(false);
             }
+            let seq = accepted + 1;
+            let stored_seq = sql_seq(seq)?;
             let kind = match ending {
                 HeldJobEnding::Dependency { .. } | HeldJobEnding::Requested => {
                     JobEventKind::JobCancelled
@@ -366,79 +372,47 @@ impl Store {
                 authority: route.authority,
                 digest: route.digest.clone(),
                 event: JobEvent {
-                    job,
-                    seq: 1,
-                    event: kind,
-                    run: None,
-                    resource_name: None,
-                    resource_label: None,
-                    process: None,
-                    attention: None,
-                    at: Utc::now(),
-                    blocked: None,
                     held_ending: Some(ending.clone()),
-                    gpu_idle: None,
-                    gpu_summaries: Vec::new(),
-                    lease_idle: None,
-                    timeout: None,
-                    machine_released: None,
+                    ..origin_event(job, seq, kind)
                 },
             };
             route.submission = JobSubmission::Ended { ending };
             self.conn.execute(
-                "INSERT INTO resource_job_inbox(job_id,seq,event_json) VALUES (?1,1,?2)",
-                params![job.to_string(), serde_json::to_string(&envelope)?],
+                "INSERT INTO resource_job_inbox(job_id,seq,event_json) VALUES (?1,?2,?3)",
+                params![
+                    job.to_string(),
+                    stored_seq,
+                    serde_json::to_string(&envelope)?
+                ],
             )?;
             self.conn.execute(
-                "UPDATE resource_job_routes SET accepted_seq=1,route_json=?2 WHERE job_id=?1",
-                params![job.to_string(), serde_json::to_string(&route)?],
+                "UPDATE resource_job_routes SET accepted_seq=?2,route_json=?3 WHERE job_id=?1",
+                params![job.to_string(), stored_seq, serde_json::to_string(&route)?],
             )?;
             Ok(true)
         }
     }
 
-    /// End every job this origin sent to `machine` or holds for it that has
-    /// no final event, once cloudlease confirmed the machine gone
+    /// Rerun or end one job this origin sent to `machine` or holds pinned to
+    /// it, once cloudlease confirmed the machine gone; `None` when the job is
+    /// no longer that machine's or already has its final event
     ///
-    /// The machine can never send another event, so each sent job gets a
-    /// `JOB_FAILED` after the last event it did send, carrying `released`.
-    /// A job still held for the machine, pinned to it while it waited for
-    /// its `after` entries or a slot, can never reach it, so it fails with
-    /// `held_ending` code `machine_released`. A job whose final event already
-    /// arrived is left alone. Returns the jobs it ended
-    pub fn end_jobs_of_released_machine(
+    /// The machine can never send another event. A job still held for the
+    /// machine, pinned to it while it waited for its `after` entries or a
+    /// slot, can never reach it, so it fails with `held_ending` code
+    /// `machine_released`. A sent job `policy` lets run again gets a
+    /// `JOB_PREEMPTED` carrying [`MachineLost`] and is held for another
+    /// machine of its pool; any other gets a `JOB_FAILED` after the last
+    /// event it sent, carrying `released`
+    pub fn end_job_of_released_machine(
         &self,
+        job: JobId,
         machine: MachineId,
         released: &MachineReleased,
-    ) -> Result<Vec<JobId>, AppError> {
+        policy: &RerunPolicy,
+    ) -> Result<Option<Rerun>, AppError> {
         self.immediate(|| {
-            let mut statement = self.conn.prepare(
-                "SELECT r.job_id FROM resource_job_routes r
-                 WHERE json_extract(r.route_json, '$.authority') = ?1
-                   AND json_extract(r.route_json, '$.submission.state')
-                       IN ('accepted', 'unknown', 'held')
-                   AND NOT EXISTS (
-                       SELECT 1 FROM resource_job_inbox i
-                       WHERE i.job_id = r.job_id
-                         AND json_extract(i.event_json, '$.event.event')
-                             IN ('JOB_SUCCEEDED', 'JOB_FAILED', 'JOB_CANCELLED'))",
-            )?;
-            let jobs = statement
-                .query_map([machine.to_string()], |row| row.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-            drop(statement);
-            let mut ended = Vec::with_capacity(jobs.len());
-            for job in jobs {
-                let job: JobId = job.parse()?;
-                let held = self
-                    .job_route(job)?
-                    .is_some_and(|route| matches!(route.submission, JobSubmission::Held));
-                if !held {
-                    self.append_released_failure(job, released)?;
-                    ended.push(job);
-                    continue;
-                }
-
+            if self.held_route_on(job, machine)?.is_some() {
                 let ending = HeldJobEnding::Refused {
                     code: "machine_released".to_owned(),
                     message: format!(
@@ -446,51 +420,204 @@ impl Store {
                         released.machine, released.pool, released.reason
                     ),
                 };
-                if self.end_held_job_inner(job, ending)? {
-                    ended.push(job);
+                let ended = self.end_held_job_inner(job, ending)?;
+                return Ok(ended.then_some(Rerun::End(None)));
+            }
+
+            let Some(route) = self.unfinished_route_on(job, machine)? else {
+                return Ok(None);
+            };
+            let rerun = decide_rerun(policy, &released.reason, &route);
+            match rerun {
+                Rerun::Queue { attempt } => {
+                    let lost = MachineLost {
+                        pool: released.pool.clone(),
+                        machine: released.machine.clone(),
+                        reason: released.reason.clone(),
+                        ends_at: None,
+                        attempt,
+                        max_attempts: policy.max_attempts,
+                    };
+                    self.queue_again(route, lost)?;
+                }
+                Rerun::End(not_rerun) => {
+                    let released = MachineReleased {
+                        attempt: route.attempt(),
+                        not_rerun,
+                        ..released.clone()
+                    };
+                    self.append_released_failure(route, &released)?;
                 }
             }
-            Ok(ended)
+            Ok(Some(rerun))
         })
     }
 
-    fn append_released_failure(
+    /// Queue one job this origin sent to `machine` again if `policy` lets
+    /// it run again, when the machine gave notice that its provider ends it
+    /// soon; whether it was queued
+    ///
+    /// The machine still runs, so a job that may not run again is left to
+    /// finish there or to end once cloudlease confirms the machine gone
+    pub fn rerun_job_of_ending_machine(
         &self,
         job: JobId,
-        released: &MachineReleased,
-    ) -> Result<(), AppError> {
-        let route = self
+        machine: MachineId,
+        lost: &MachineLost,
+        policy: &RerunPolicy,
+    ) -> Result<bool, AppError> {
+        self.immediate(|| {
+            let Some(route) = self.unfinished_route_on(job, machine)? else {
+                return Ok(false);
+            };
+            let Rerun::Queue { attempt } = decide_rerun(policy, &lost.reason, &route) else {
+                return Ok(false);
+            };
+            let lost = MachineLost {
+                attempt,
+                ..lost.clone()
+            };
+            self.queue_again(route, lost)?;
+            Ok(true)
+        })
+    }
+
+    /// The job's route while it was sent to `machine` and has no final event
+    fn unfinished_route_on(
+        &self,
+        job: JobId,
+        machine: MachineId,
+    ) -> Result<Option<JobRoute>, AppError> {
+        let route = self.job_route(job)?;
+        let open = self.unfinished_jobs_on(machine)?.contains(&job);
+        Ok(route.filter(|_| open))
+    }
+
+    /// Record that someone asked to cancel a job this origin sent, before
+    /// the cancel goes to `authority`; a cancel sent to any other machine
+    /// cannot stop the job, so it is not recorded
+    pub fn request_job_cancel(&self, job: JobId, authority: MachineId) -> Result<(), AppError> {
+        let Some(mut route) = self.job_route(job)? else {
+            return Ok(());
+        };
+        if route.cancel_requested || route.authority != authority {
+            return Ok(());
+        }
+        route.cancel_requested = true;
+        self.save_route(&route)
+    }
+
+    /// Jobs this origin sent to `machine` that have no final event, oldest
+    /// first
+    pub fn unfinished_jobs_on(&self, machine: MachineId) -> Result<Vec<JobId>, AppError> {
+        self.jobs_on(machine, OnMachine::Sent)
+    }
+
+    /// Jobs this origin sent to `machine` or holds pinned to it that have no
+    /// final event, oldest first: what a machine cloudlease confirmed gone
+    /// leaves to end or rerun
+    pub fn jobs_of_released_machine(&self, machine: MachineId) -> Result<Vec<JobId>, AppError> {
+        self.jobs_on(machine, OnMachine::SentOrHeld)
+    }
+
+    fn jobs_on(&self, machine: MachineId, which: OnMachine) -> Result<Vec<JobId>, AppError> {
+        let states = match which {
+            OnMachine::Sent => "('accepted', 'unknown')",
+            OnMachine::SentOrHeld => "('accepted', 'unknown', 'held')",
+        };
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT r.job_id FROM resource_job_routes r
+             WHERE json_extract(r.route_json, '$.authority') = ?1
+               AND json_extract(r.route_json, '$.submission.state') IN {states}
+               AND NOT EXISTS (
+                   SELECT 1 FROM resource_job_inbox i
+                   WHERE i.job_id = r.job_id
+                     AND json_extract(i.event_json, '$.event.event')
+                         IN ('JOB_SUCCEEDED', 'JOB_FAILED', 'JOB_CANCELLED'))
+             ORDER BY r.created_at",
+        ))?;
+        let jobs = statement
+            .query_map([machine.to_string()], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        jobs.into_iter()
+            .map(|job| job.parse().map_err(AppError::from))
+            .collect()
+    }
+
+    /// The job's route while it is held pinned to `machine` with no final
+    /// event
+    fn held_route_on(&self, job: JobId, machine: MachineId) -> Result<Option<JobRoute>, AppError> {
+        let held = self.jobs_on(machine, OnMachine::SentOrHeld)?.contains(&job);
+        Ok(self
             .job_route(job)?
-            .ok_or(QueueError::JobNotFound { job })?;
+            .filter(|route| held && matches!(route.submission, JobSubmission::Held)))
+    }
+
+    /// Record that the job's machine was lost and hold it for placement
+    /// again, as the attempt `lost` names
+    ///
+    /// The `JOB_PREEMPTED` closes the lost run's events, and the next
+    /// machine's events follow it in the origin inbox
+    fn queue_again(&self, mut route: JobRoute, lost: MachineLost) -> Result<(), AppError> {
+        let job = route.job;
         let accepted = self
             .job_route_cursors(job)?
             .ok_or(QueueError::JobNotFound { job })?
             .accepted;
         let seq = accepted + 1;
-        let stored_seq = i64::try_from(seq).map_err(|_| AppError::Internal {
-            message: format!("job {job} event sequence {seq} does not fit"),
-        })?;
+        let stored_seq = sql_seq(seq)?;
         let envelope = RoutedJobEvent {
             origin: route.origin,
             authority: route.authority,
             digest: route.digest.clone(),
             event: JobEvent {
-                job,
-                seq,
-                event: JobEventKind::JobFailed,
-                run: None,
-                resource_name: None,
-                resource_label: None,
-                process: None,
-                attention: None,
-                at: Utc::now(),
-                blocked: None,
-                held_ending: None,
-                gpu_idle: None,
-                gpu_summaries: Vec::new(),
-                lease_idle: None,
-                timeout: None,
+                machine_lost: Some(lost.clone()),
+                ..origin_event(job, seq, JobEventKind::JobPreempted)
+            },
+        };
+        route.rerun = Some(delivery::Rerun {
+            attempt: lost.attempt,
+            seq_base: seq,
+        });
+        route.authority = route.origin;
+        route.target = None;
+        route.submission = JobSubmission::Held;
+        // the origin now owns sending it again, so it owes the final event
+        route.owes_final_event = true;
+        self.conn.execute(
+            "INSERT INTO resource_job_inbox(job_id,seq,event_json) VALUES (?1,?2,?3)",
+            params![
+                job.to_string(),
+                stored_seq,
+                serde_json::to_string(&envelope)?
+            ],
+        )?;
+        self.conn.execute(
+            "UPDATE resource_job_routes SET accepted_seq=?2,route_json=?3 WHERE job_id=?1",
+            params![job.to_string(), stored_seq, serde_json::to_string(&route)?],
+        )?;
+        Ok(())
+    }
+
+    fn append_released_failure(
+        &self,
+        route: JobRoute,
+        released: &MachineReleased,
+    ) -> Result<(), AppError> {
+        let job = route.job;
+        let accepted = self
+            .job_route_cursors(job)?
+            .ok_or(QueueError::JobNotFound { job })?
+            .accepted;
+        let seq = accepted + 1;
+        let stored_seq = sql_seq(seq)?;
+        let envelope = RoutedJobEvent {
+            origin: route.origin,
+            authority: route.authority,
+            digest: route.digest.clone(),
+            event: JobEvent {
                 machine_released: Some(released.clone()),
+                ..origin_event(job, seq, JobEventKind::JobFailed)
             },
         };
         let mut route = route;
@@ -616,7 +743,6 @@ impl Store {
     pub fn accept_job_event(&self, envelope: &RoutedJobEvent) -> Result<EventAcceptance, AppError> {
         self.immediate(|| {
             let event = &envelope.event;
-            let seq = sql_seq(event.seq)?;
             let mut route = self
                 .job_route(event.job)?
                 .ok_or(QueueError::JobNotFound { job: event.job })?;
@@ -639,25 +765,36 @@ impl Store {
                     message: "job sequence must be positive".into(),
                 });
             }
-            if event.seq <= accepted {
+            // the authority numbers the current run's events from 1, and the
+            // origin stores them after its earlier runs' events; answers stay
+            // in the authority's numbering
+            let base = route.seq_base();
+            let mut stored = envelope.clone();
+            stored.event.seq = event.seq.checked_add(base).ok_or_else(|| AppError::Usage {
+                message: "job event sequence is too large".into(),
+            })?;
+            let seq = sql_seq(stored.event.seq)?;
+            if stored.event.seq <= accepted {
                 let json: String = self.conn.query_row(
                     "SELECT event_json FROM resource_job_inbox WHERE job_id=?1 AND seq=?2",
                     params![event.job.to_string(), seq],
                     |row| row.get(0),
                 )?;
                 let saved: RoutedJobEvent = serde_json::from_str(&json)?;
-                if saved != *envelope {
+                if saved != stored {
                     return Err(QueueError::JobConflict { job: event.job }.into());
                 }
                 return Ok(EventAcceptance::Acknowledged { seq: event.seq });
             }
-            if event.seq != accepted + 1 {
-                return Ok(EventAcceptance::Expected { seq: accepted + 1 });
+            if stored.event.seq != accepted + 1 {
+                return Ok(EventAcceptance::Expected {
+                    seq: accepted + 1 - base,
+                });
             }
             route.submission = JobSubmission::Accepted;
             self.conn.execute(
                 "INSERT INTO resource_job_inbox(job_id,seq,event_json) VALUES (?1,?2,?3)",
-                params![event.job.to_string(), seq, serde_json::to_string(envelope)?],
+                params![event.job.to_string(), seq, serde_json::to_string(&stored)?],
             )?;
             self.conn.execute(
                 "UPDATE resource_job_routes SET accepted_seq=?2,route_json=?3 WHERE job_id=?1",
@@ -817,6 +954,57 @@ impl Store {
         }
         Ok(())
     }
+}
+
+/// An event the origin writes itself for its own route, with no run
+fn origin_event(job: JobId, seq: u64, event: JobEventKind) -> JobEvent {
+    JobEvent {
+        job,
+        seq,
+        event,
+        run: None,
+        resource_name: None,
+        resource_label: None,
+        process: None,
+        attention: None,
+        at: Utc::now(),
+        blocked: None,
+        held_ending: None,
+        gpu_idle: None,
+        gpu_summaries: Vec::new(),
+        lease_idle: None,
+        timeout: None,
+        machine_released: None,
+        machine_lost: None,
+    }
+}
+
+/// Which of a machine's routes a lookup returns
+#[derive(Clone, Copy)]
+enum OnMachine {
+    /// Jobs sent to the machine's queue
+    Sent,
+    /// Jobs sent to it, and jobs held pinned to it
+    SentOrHeld,
+}
+
+/// What `policy` decides for a job on `route` whose machine was lost for `reason`
+fn decide_rerun(policy: &RerunPolicy, reason: &ReleaseReason, route: &JobRoute) -> Rerun {
+    // only CI jobs reach a pool machine; anything else is ended as before
+    let Some(ci) = &route.spec.ci else {
+        return Rerun::End(None);
+    };
+    let decision = policy.decide(
+        reason,
+        route.attempt(),
+        ci.kill_after.get(),
+        route.spec.machine.is_some(),
+    );
+    // the authority may lose the machine before it ends the cancelled run
+    if route.cancel_requested && matches!(decision, Rerun::Queue { .. }) {
+        return Rerun::End(Some(NotRerun::Cancelled));
+    }
+    decision
 }
 
 pub(super) fn sql_seq(seq: u64) -> Result<i64, AppError> {
