@@ -549,13 +549,16 @@ fn a_job_behind_that_waits_for_memory_holds_back_no_preemption() {
     assert_eq!(decisions.preemption, None);
 }
 
+fn hold(peak: f64, held_gib: u64, behind: Option<JobId>) -> MemoryHold {
+    MemoryHold {
+        peak: MemPeak::from_gib(peak).unwrap(),
+        held: held_gib << 30,
+        behind,
+    }
+}
+
 #[test]
 fn the_job_next_for_a_busy_gpu_holds_what_the_run_ahead_will_not_free() {
-    const GIB: u64 = 1 << 30;
-    let hold = |peak: f64, held: u64| MemoryHold {
-        peak: MemPeak::from_gib(peak).unwrap(),
-        held: held * GIB,
-    };
     // the 11-20 Vesuvius shape: a 28 GiB trace queued behind a 4 GiB predict
     let mut machine = Machine::new(&["gpu0"]);
     let (predict, _) = machine.running("gpu0", Priority::Medium, HELD, executing(t0()));
@@ -575,17 +578,18 @@ fn the_job_next_for_a_busy_gpu_holds_what_the_run_ahead_will_not_free() {
     let decisions = decide(&machine.snapshot(t0()));
     assert_eq!(
         decisions.memory_holds.into_iter().collect::<Vec<_>>(),
-        [(trace, hold(28.0, 24))]
+        [(trace, hold(28.0, 24, Some(predict)))]
     );
 
     // a run without a peak frees an unknown amount, so the whole peak is held
     machine.set_peak(predict, None);
     let holds = decide(&machine.snapshot(t0())).memory_holds;
-    assert_eq!(holds.get(&trace), Some(&hold(28.0, 28)));
+    assert_eq!(holds.get(&trace), Some(&hold(28.0, 28, None)));
 
-    // a run that frees at least the peak leaves nothing to hold
+    // a run that frees at least the peak leaves nothing to hold until it ends
     machine.set_peak(predict, Some(28.0));
-    assert!(decide(&machine.snapshot(t0())).memory_holds.is_empty());
+    let holds = decide(&machine.snapshot(t0())).memory_holds;
+    assert_eq!(holds.get(&trace), Some(&hold(28.0, 0, Some(predict))));
 
     // a run cleaning up after a preemption already gave its memory back,
     // though its job is still queued, so the whole peak is held
@@ -599,7 +603,38 @@ fn the_job_next_for_a_busy_gpu_holds_what_the_run_ahead_will_not_free() {
         .state = QueuedState::Queued;
     machine.set_run(gpu0, predict, task, RunPhase::Cleaning { attempt: 1 });
     let holds = decide(&machine.snapshot(t0())).memory_holds;
-    assert_eq!(holds.get(&trace), Some(&hold(28.0, 28)));
+    assert_eq!(holds.get(&trace), Some(&hold(28.0, 28, None)));
+}
+
+#[test]
+fn a_job_holds_for_the_busy_resources_it_is_next_for() {
+    let mut machine = Machine::new(&["gpu0", "gpu1"]);
+    let gpu0 = machine.resource("gpu0");
+    let (first, _) = machine.running("gpu0", Priority::Medium, HELD, executing(t0()));
+    let (second, _) = machine.running("gpu1", Priority::Medium, HELD, executing(t0()));
+    let pinned = machine.queued(Priority::Medium, Target::Pinned(gpu0), YIELD);
+    let any = machine.queued(Priority::Medium, Target::Any, YIELD);
+    machine.set_peak(first, Some(2.0));
+    machine.set_peak(second, Some(6.0));
+    machine.set_peak(pinned, Some(10.0));
+    machine.set_peak(any, Some(20.0));
+    machine.set_hold_room(pinned);
+    machine.set_hold_room(any);
+
+    // the pinned job is next for gpu0 and the any job for gpu1, which it
+    // takes when gpu1 frees first, so each holds behind its own resource
+    let holds = decide(&machine.snapshot(t0())).memory_holds;
+    assert_eq!(holds.get(&pinned), Some(&hold(10.0, 8, Some(first))));
+    assert_eq!(holds.get(&any), Some(&hold(20.0, 14, Some(second))));
+}
+
+#[test]
+fn a_job_with_no_resource_it_may_use_holds_nothing() {
+    let mut machine = Machine::new(&[]);
+    let job = machine.queued(Priority::Medium, Target::Any, YIELD);
+    machine.set_peak(job, Some(8.0));
+    machine.set_hold_room(job);
+    assert!(decide(&machine.snapshot(t0())).memory_holds.is_empty());
 }
 
 #[test]
@@ -626,8 +661,8 @@ fn a_job_behind_a_launch_this_pass_holds_what_that_launch_will_not_free() {
         }]
     );
     assert_eq!(
-        decisions.memory_holds.get(&trace).map(|hold| hold.held),
-        Some(24 * GIB)
+        decisions.memory_holds.get(&trace),
+        Some(&hold(28.0, 24, Some(predict)))
     );
 }
 

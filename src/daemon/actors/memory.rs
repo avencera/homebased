@@ -198,11 +198,13 @@ pub(crate) struct JobMemory {
 }
 
 impl JobMemory {
-    /// Bytes these jobs keep from every task
+    /// Bytes these jobs keep from every task, given the jobs whose runs
+    /// claim memory now
     ///
     /// An unreadable gauge already starts nothing, so its waits reserve
-    /// nothing extra
-    fn reserved(&self) -> u64 {
+    /// nothing extra. A hold behind a job that waits for memory counts that
+    /// job as claiming, since its wait reserves its peak already
+    fn reserved(&self, claiming: &HashSet<JobId>) -> u64 {
         let waits: u64 = self
             .waits
             .values()
@@ -211,7 +213,13 @@ impl JobMemory {
                 MemoryWait::Unreadable { .. } => 0,
             })
             .sum();
-        waits + self.holds.values().map(|hold| hold.held).sum::<u64>()
+        let still_claims = |job| claiming.contains(&job) || self.waits.contains_key(&job);
+        let holds: u64 = self
+            .holds
+            .values()
+            .map(|hold| hold.bytes(still_claims))
+            .sum();
+        waits + holds
     }
 }
 
@@ -240,6 +248,14 @@ pub(crate) struct MemoryState {
     /// Tasks whose review the store already answered for, so a pass does not
     /// ask it again each second; the store keeps the durable once-only mark
     reviewed: HashSet<TaskId>,
+}
+
+/// The room under the bar now, what each running task held, and the jobs
+/// whose runs claim memory, from one read of the claims
+struct Measured {
+    room: Room,
+    holdings: Vec<Holding>,
+    claiming: HashSet<JobId>,
 }
 
 /// A running task's share of what started work holds
@@ -311,7 +327,7 @@ impl Actor for MemoryActor {
     ) -> Result<(), ActorProcessingErr> {
         match message {
             MemoryMsg::JobRoom { reply } => {
-                send_reply(reply, state.room().await.map(|(room, _)| room));
+                send_reply(reply, state.room().await.map(|measured| measured.room));
             }
             MemoryMsg::GrantJob {
                 job,
@@ -338,11 +354,11 @@ impl Actor for MemoryActor {
 }
 
 impl MemoryState {
-    /// The room under the bar, after started work and live grants, and what
-    /// each running task held
+    /// The room under the bar, after started work and live grants, what
+    /// each running task held, and the jobs whose runs claim memory
     ///
     /// Blocking procfs and cgroupfs reads, each a few files
-    async fn room(&mut self) -> Result<(Room, Vec<Holding>), AppError> {
+    async fn room(&mut self) -> Result<Measured, AppError> {
         let machine = self.args.machine;
         let claims = call(&self.args.store, |reply| StoreMsg::MemoryClaims {
             machine,
@@ -365,7 +381,18 @@ impl MemoryState {
             Grant::Task(_) => true,
         });
         room.reserve(self.grants.values().map(|(peak, _)| peak.bytes()).sum());
-        Ok((room, holdings))
+        let claiming = claims
+            .iter()
+            .filter_map(|claim| match claim.owner {
+                ClaimOwner::Job(job) => Some(job),
+                ClaimOwner::Task(_) => None,
+            })
+            .collect();
+        Ok(Measured {
+            room,
+            holdings,
+            claiming,
+        })
     }
 
     async fn grant_job(
@@ -374,7 +401,7 @@ impl MemoryState {
         peak: MemPeak,
         held_back: u64,
     ) -> Result<Result<(), MemoryWait>, AppError> {
-        let (mut room, _) = self.room().await?;
+        let mut room = self.room().await?.room;
         room.reserve(held_back);
         let granted = room.admit(peak);
         if granted.is_ok() {
@@ -404,9 +431,10 @@ impl MemoryState {
         let mut head = None;
         let mut holdings = Vec::new();
         if !ready.is_empty() {
-            let (mut room, held) = self.room().await?;
-            holdings = held;
-            room.reserve(self.jobs.reserved());
+            let measured = self.room().await?;
+            let mut room = measured.room;
+            holdings = measured.holdings;
+            room.reserve(self.jobs.reserved(&measured.claiming));
             for candidate in ready {
                 // a pending launch's grant is already in the room, and its
                 // retry needs no more
@@ -525,11 +553,16 @@ mod tests {
     use ractor::Actor;
     use tempfile::tempdir;
 
-    use super::{MemoryActor, MemoryArgs, MemoryLimits, MemoryMsg, REVIEW_AFTER, TaskCandidate};
+    use std::collections::HashSet;
+
+    use super::{
+        JobMemory, MemoryActor, MemoryArgs, MemoryLimits, MemoryMsg, REVIEW_AFTER, TaskCandidate,
+    };
     use crate::daemon::actors::{StoreActor, call};
     use crate::domain::TaskId;
     use crate::machine::MachineId;
-    use crate::memory::{Gauge, MemPeak, MemoryWait, Room};
+    use crate::memory::{Gauge, MemPeak, MemoryHold, MemoryWait, Room};
+    use crate::queue::JobId;
 
     const GIB: u64 = 1 << 30;
 
@@ -539,6 +572,36 @@ mod tests {
             peak: MemPeak::parse(gib).unwrap(),
             backing_off,
         }
+    }
+
+    #[test]
+    fn a_hold_counts_the_job_ahead_only_while_that_job_still_claims_its_peak() {
+        let (predict, trace) = (JobId::new(), JobId::new());
+        let mut jobs = JobMemory::default();
+        jobs.holds.insert(
+            trace,
+            MemoryHold {
+                peak: MemPeak::parse("8").unwrap(),
+                held: 6 * GIB,
+                behind: Some(predict),
+            },
+        );
+
+        // the predict runs: its 2 GiB claim comes back to the trace when it ends
+        assert_eq!(jobs.reserved(&HashSet::from([predict])), 6 * GIB);
+        // the predict entered cleanup before the queue pass saw it: its claim
+        // is gone, so a task cannot start into the 2 GiB the trace now needs
+        assert_eq!(jobs.reserved(&HashSet::new()), 8 * GIB);
+        // a job ahead that waits for memory reserves its peak already
+        jobs.waits.insert(
+            predict,
+            MemoryWait::Room {
+                peak: MemPeak::parse("2").unwrap(),
+                free: 0,
+                bar: 10 * GIB,
+            },
+        );
+        assert_eq!(jobs.reserved(&HashSet::new()), 8 * GIB);
     }
 
     #[tokio::test]

@@ -58,7 +58,7 @@ impl Store {
                 continue;
             };
             claims.push(Claim {
-                owner: ClaimOwner::Job,
+                owner: ClaimOwner::Job(run.job),
                 peak,
                 root: self.child_pid(run.task)?,
             });

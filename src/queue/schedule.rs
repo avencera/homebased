@@ -214,11 +214,12 @@ pub struct Decisions {
 ///    from it. Otherwise the victim would lose its step while the GPU sits idle.
 ///    The lowest level goes first, then the cheapest stop, then the most recent
 ///    start. The first queued job remains the notice head
-/// 3. A job with `hold_room` whose resources are all busy, and that no job
-///    ahead of it waits for any of the same resources, holds back from tasks
-///    its peak less the least that one of those resources' jobs frees when
-///    it ends. It holds nothing from other GPU jobs: one behind it that finds
-///    a free resource starts now rather than leave that GPU idle
+/// 3. A job with `hold_room` whose resources are all busy, and that is the
+///    first waiting job in serving order for at least one of them, holds back
+///    from tasks its peak less the least that the job on one of those
+///    resources frees when it ends. It holds nothing from other GPU jobs: one
+///    behind it that finds a free resource starts now rather than leave that
+///    GPU idle
 #[must_use]
 pub fn decide(snapshot: &Snapshot) -> Decisions {
     let mut free: Vec<&ResourceView> = snapshot
@@ -288,60 +289,61 @@ pub fn decide(snapshot: &Snapshot) -> Decisions {
 /// The room each `hold_room` job next in line for busy resources holds back
 /// from tasks
 ///
-/// A job behind another that waits for any of the same resources holds
-/// nothing, since it cannot start before that one. A job ahead of it frees
-/// its own peak when it ends, so only the rest is held; the least any of the
-/// job's resources frees counts, as any of them may come free first. A job
-/// without a peak, or a run whose job is gone, frees an unknown amount, and a
-/// run cleaning up or in `Attention` already gave its memory back, so these
-/// count nothing
+/// A busy resource's next job is the first waiting job that may use it; a job
+/// next for none of its resources holds nothing, since it cannot start before
+/// the jobs ahead of it. The job ahead on a resource frees its own peak when
+/// it ends, so only the rest is held; the least any of the job's resources
+/// frees counts, as any of them may come free first. A job without a peak, or
+/// a run whose job is gone, frees an unknown amount, and a run cleaning up or
+/// in `Attention` already gave its memory back, so these count nothing
 fn memory_holds(
     snapshot: &Snapshot,
     waiting: &[&JobView],
     taken: &[(ResourceId, &JobView)],
 ) -> BTreeMap<JobId, MemoryHold> {
-    let shares_resource = |left: &JobView, right: &JobView| {
-        snapshot
-            .resources
-            .iter()
-            .any(|resource| left.target.allows(resource.id) && right.target.allows(resource.id))
-    };
-    // what the job on a busy resource frees when it ends
-    let frees = |resource: &ResourceView| {
+    // the job whose end frees a busy resource, with the peak it frees
+    let ahead = |resource: &ResourceView| {
         let job = match &resource.run {
             Some(run) => run.phase.holds_job().then_some(run.job),
             None => taken
                 .iter()
                 .find(|(id, _)| *id == resource.id)
                 .map(|(_, job)| job.id),
-        };
-        job.and_then(|job| snapshot.queue.iter().find(|view| view.id == job))
-            .and_then(|view| view.mem_peak)
-            .map_or(0, MemPeak::bytes)
+        }?;
+        let peak = snapshot
+            .queue
+            .iter()
+            .find(|view| view.id == job)?
+            .mem_peak?;
+        Some((peak.bytes(), job))
     };
 
     let mut holds = BTreeMap::new();
-    for (index, job) in waiting.iter().enumerate() {
+    for job in waiting {
         let Some(peak) = job.mem_peak.filter(|_| job.hold_room) else {
             continue;
         };
-        if waiting[..index]
-            .iter()
-            .any(|ahead| shares_resource(ahead, job))
-        {
+        let next_for = snapshot.resources.iter().filter(|resource| {
+            waiting
+                .iter()
+                .find(|first| first.target.allows(resource.id))
+                .is_some_and(|first| first.id == job.id)
+        });
+        let Some(least) = next_for
+            .map(|resource| ahead(resource).unwrap_or((0, job.id)))
+            .min_by_key(|(freed, _)| *freed)
+        else {
             continue;
-        }
-        let freed = snapshot
-            .resources
-            .iter()
-            .filter(|resource| job.target.allows(resource.id))
-            .map(frees)
-            .min()
-            .unwrap_or(0);
-        let held = peak.bytes().saturating_sub(freed);
-        if held > 0 {
-            holds.insert(job.id, MemoryHold { peak, held });
-        }
+        };
+        let (freed, behind) = least;
+        holds.insert(
+            job.id,
+            MemoryHold {
+                peak,
+                held: peak.bytes().saturating_sub(freed),
+                behind: (freed > 0).then_some(behind),
+            },
+        );
     }
     holds
 }

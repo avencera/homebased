@@ -19,6 +19,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::domain::TaskId;
+use crate::queue::JobId;
 
 const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
@@ -192,10 +193,36 @@ pub struct MemoryHold {
     pub peak: MemPeak,
     /// Bytes held: the peak less what the job ahead of it frees when it ends
     pub held: u64,
+    /// The job ahead whose peak `held` leaves out; once that job no longer
+    /// claims its peak, its memory is already back, so the whole peak is held
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behind: Option<JobId>,
+}
+
+impl MemoryHold {
+    /// Bytes held from tasks while `claims` is what started work holds
+    ///
+    /// The queue pass that set the hold may be older than `claims`: a run
+    /// that entered cleanup since gave its memory back, so its peak no longer
+    /// comes off the hold
+    #[must_use]
+    pub fn bytes(&self, still_claims: impl Fn(JobId) -> bool) -> u64 {
+        match self.behind {
+            Some(job) if !still_claims(job) => self.peak.bytes(),
+            _ => self.held,
+        }
+    }
 }
 
 impl fmt::Display for MemoryHold {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.held == 0 {
+            return write!(
+                f,
+                "holds its {} peak from tasks once the job ahead of it ends",
+                self.peak
+            );
+        }
         write!(
             f,
             "holding {} of its {} peak from tasks until its resource is free",
@@ -281,7 +308,7 @@ pub enum ClaimOwner {
     /// A task submitted on this machine
     Task(TaskId),
     /// A GPU queue job's run, which reports through its job
-    Job,
+    Job(JobId),
 }
 
 /// An item with a peak that started and has not ended
@@ -603,7 +630,7 @@ mod tests {
     #[test]
     fn a_claim_without_a_process_counts_its_whole_peak() {
         let claims = [Claim {
-            owner: super::ClaimOwner::Job,
+            owner: super::ClaimOwner::Job(crate::queue::JobId::new()),
             peak: gib(3.0),
             root: None,
         }];
