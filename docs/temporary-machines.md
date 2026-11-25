@@ -114,6 +114,18 @@ A renewal that fails, such as with no answer or `401 unauthorized`, is tried aga
 
 On a provider that bills every started hour, phoenixNAP and Latitude.sh, cloudlease names in each renew answer when the machine's paid hour ends, less 10 minutes for the release to finish, as `idle_hold_until`. An idle machine stays until then instead of releasing at `--idle-limit`, so a job that arrives in that window uses time already paid for. The hold applies at once in the first hour. After it, cloudlease names no hold within the boot grace after each hour from create turns, when the provider's next hour could start before then, since it does not know exactly when the provider's billing started; nor when the hold would pass the lease's hard deadline, and so the pool's deadline; or on a provider that bills by the second, DigitalOcean and AWS. A hold never starts a new hour, so it adds nothing to the run's spend or its spend cap. If `--idle-limit` ends after the hold, the machine releases at `--idle-limit` as before. A machine also waits for its first renew answer before an idle release, so even `--idle-limit 0s` keeps a hold cloudlease names.
 
+## Code on the machine
+
+A pool machine holds no git credential, so it never fetches from a job's remote. A job with a commit (`ci run --git`, or `--repo` and `--commit`), including one pinned to a pool machine with `--machine`, gets it from the coordinator, public repository or private:
+
+1. At submit, the coordinator fetches the commit with `git fetch --depth=1 <remote> <commit>` into a bare mirror of the pool (`pools/<pool>/git/` in its state directory), using the coordinator daemon's own git credentials, such as its user's ssh keys or credential helper, with prompts off. The remote must give a commit by its id, as GitHub and git servers speaking protocol v2 do; unlike a Fleet machine's CI slot, the coordinator does not fall back to fetching every branch. It writes a bundle of that one commit: its tree, no history, no tags, and no other refs, to `pools/<pool>/bundles/<commit>.bundle`, with the bundle's size and sha256 beside it. Jobs on the same commit share it: since a commit id names the commit's whole content, a later job on a commit the pool already has a bundle of uses it without fetching, whatever remote it names.
+2. The submit is refused, before the job is held and before the pool asks for any machine, when the coordinator cannot get the commit (`commit_unavailable`: not pushed, wrong remote, or no credentials for it), when the commit's tree has a `.gitmodules` (`submodules_unsupported`: a machine could not fetch a private submodule), or when the bundle is over 2 GiB (`bundle_too_large`). Each exits 2.
+3. When the run starts, its checkout runs `homebased ci fetch-bundle <job>` on the machine, unless the slot's clone already has the commit. The machine's daemon downloads `GET /v1/cluster/pool/jobs/{job}/bundle` from the coordinator over the [link](#link), which serves a job's bundle only to the machine the job is placed on. The download streams to disk with no overall time limit beyond `--kill-after`; the answer must start within 60 seconds and the body must not stall for 60. The machine checks the size and sha256 and keeps one copy per commit, in `ci/bundles/` of its state directory, for all its slots.
+4. A broken, stalled, or damaged download is tried 3 times, 2 and then 4 seconds apart, each failure going to the run's log; after the third the run fails with the reason. A refusal from the coordinator, such as a bundle it no longer has, fails the run at once.
+5. The checkout records the commit as a shallow root and fetches it from the bundle, then checks it out as on any CI slot. The checkout is shallow: `git log` shows one commit and `git describe` finds no tag.
+
+When the pool is released, the coordinator removes its mirrors and bundles.
+
 ## Outputs and lost machines
 
 A job must finish its own uploads before it exits; the machine releases itself only once no run is left and every event reached the coordinator. When cloudlease deletes a machine under running work, at its hard deadline, after its heartbeat lapsed, or after `pool release`, the job's submitter gets `JOB_FAILED` with `machine_released`:
@@ -130,7 +142,7 @@ Anything the job wrote on the machine and had not uploaded is gone; the task log
 
 ## Secrets
 
-Boot data is readable by anything on the machine through the provider's metadata service, so it carries no secret beyond the single-use join token and the lease token, which can only renew or release its own lease. The coordinator's endpoint id and addresses in it are public. Upload tokens and other secrets go in the pool's `--env-file` on the coordinator, which reads it at each join and hands the values to the machine over the link.
+Boot data is readable by anything on the machine through the provider's metadata service, so it carries no secret beyond the single-use join token and the lease token, which can only renew or release its own lease. The coordinator's endpoint id and addresses in it are public. Upload tokens and other secrets go in the pool's `--env-file` on the coordinator, which reads it at each join and hands the values to the machine over the link. No git credential reaches the machine: the coordinator fetches each job's commit and sends it as a bundle (see [Code on the machine](#code-on-the-machine)).
 
 ## Link
 
@@ -143,7 +155,7 @@ Each side serves an endpoint id only what it granted that id:
 | Who | Grant | What the link lets it do |
 | --- | --- | --- |
 | Endpoint not bound to a lease | none (enrollment) | Only `POST /v1/cluster/pool/join`. The single-use join token binds its endpoint id to the machine's lease; a failed join closes the connection |
-| Machine of a joined lease | pool member | Join again, the Fleet probe (`/v1/cluster/machine`), and event delivery (`/v1/cluster/job-events`, `/v1/cluster/events`) for work it runs itself. No route that starts work, sends messages, or reads other machines' tasks |
+| Machine of a joined lease | pool member | Join again, the Fleet probe (`/v1/cluster/machine`), event delivery (`/v1/cluster/job-events`, `/v1/cluster/events`) for work it runs itself, and the bundles of jobs placed on it (`/v1/cluster/pool/jobs/{job}/bundle`). No route that starts work, sends messages, or reads other machines' tasks |
 | Coordinator, on the machine | peer | Every route of the machine's own API, over streams it opens on the machine's connection |
 
 The coordinator grants an id when its join succeeds, and revokes it and closes its connection when the lease leaves `joined`. The lease stays bound to that one id: a join from another id for the same lease is refused, and so is a join that names a machine id the coordinator already knows, its own or another Fleet or pool machine's. The machine grants only the coordinator's id, from its boot data.
@@ -175,6 +187,8 @@ The machine calls, with its lease token, `POST /v1/leases/{lease}/renew` and `PO
 ## Not covered
 
 - Prebuilt images. Each machine downloads Homebased at boot, about a minute.
+- Unpushed commits and submodules. The coordinator fetches a job's commit from its remote, so the commit must be pushed there, and a commit with submodules is refused.
+- Jobs that need git history on the machine. The checkout holds the job's commit alone.
 - Plain tasks sent to a pool machine with `task run --machine <name>` run there, and their runs keep the machine alive, but the coordinator does not end them when the machine is gone. Use pool jobs.
 - Draining a pool gently by hand. `pool release` releases every machine at once; let the jobs finish first, then release. Only a pool that cloudlease stopped lets its running jobs finish.
 - Pool jobs from other machines. Only the coordinator reaches pool machines, so submit pool jobs on the coordinator.

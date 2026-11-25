@@ -6,10 +6,12 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
+use hyper::body::Incoming;
 use hyper::client::conn::http1;
-use hyper::{Method, Request, StatusCode};
+use hyper::{HeaderMap, Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::Serialize;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::fleet::address::MachineAddress;
@@ -46,6 +48,21 @@ pub struct ClusterResponse {
     /// HTTP status
     pub status: StatusCode,
     /// Full body, at most the client's body limit
+    pub body: Bytes,
+}
+
+/// A streamed GET: the answer's status and headers, and for a success the
+/// body written to the caller's sink
+#[derive(Debug, Clone)]
+pub struct Download {
+    /// HTTP status
+    pub status: StatusCode,
+    /// Response headers
+    pub headers: HeaderMap,
+    /// Bytes written to the sink; none for an answer that is not a success
+    pub written: u64,
+    /// Body of an answer that is not a success, at most the client's body
+    /// limit; empty for a success
     pub body: Bytes,
 }
 
@@ -146,6 +163,73 @@ impl ClusterClient {
             })?
     }
 
+    /// GET `path` on `address`, writing a successful answer's body to `sink`
+    /// as it arrives
+    ///
+    /// The client's time limit covers connect through the response head; each
+    /// part of the body then has `idle` to arrive, so a large body takes as
+    /// long as it needs while a stalled one fails. An answer that is not a
+    /// success is read like any other, into [`Download::body`]
+    pub async fn download<W: AsyncWrite + Unpin>(
+        &self,
+        address: &MachineAddress,
+        path: &str,
+        idle: Duration,
+        sink: &mut W,
+    ) -> Result<Download, TransportError> {
+        let timeout = |timeout| TransportError::Timeout {
+            address: address.clone(),
+            timeout,
+        };
+        let http_err = |message: String| TransportError::Http {
+            address: address.clone(),
+            message,
+        };
+        let response =
+            tokio::time::timeout(self.timeout, self.open(address, Method::GET, path, None))
+                .await
+                .map_err(|_| timeout(self.timeout))??;
+        let status = response.status();
+        let headers = response.headers().clone();
+        if !status.is_success() {
+            let body = tokio::time::timeout(self.timeout, self.read_body(address, response))
+                .await
+                .map_err(|_| timeout(self.timeout))??;
+            return Ok(Download {
+                status,
+                headers,
+                written: 0,
+                body,
+            });
+        }
+
+        let mut body = response.into_body();
+        let mut written = 0_u64;
+        while let Some(frame) = tokio::time::timeout(idle, body.frame())
+            .await
+            .map_err(|_| timeout(idle))?
+        {
+            let frame = frame.map_err(|err| http_err(format!("read body: {err}")))?;
+            // a trailers frame carries no bytes of the body
+            let Ok(data) = frame.into_data() else {
+                continue;
+            };
+            sink.write_all(&data)
+                .await
+                .map_err(|err| http_err(format!("write body: {err}")))?;
+            written += data.len() as u64;
+        }
+        sink.flush()
+            .await
+            .map_err(|err| http_err(format!("write body: {err}")))?;
+        Ok(Download {
+            status,
+            headers,
+            written,
+            body: Bytes::new(),
+        })
+    }
+
     async fn exchange(
         &self,
         address: &MachineAddress,
@@ -153,6 +237,20 @@ impl ClusterClient {
         path: &str,
         body: Option<Bytes>,
     ) -> Result<ClusterResponse, TransportError> {
+        let response = self.open(address, method, path, body).await?;
+        let status = response.status();
+        let body = self.read_body(address, response).await?;
+        Ok(ClusterResponse { status, body })
+    }
+
+    /// Send one request and wait for the response head
+    async fn open(
+        &self,
+        address: &MachineAddress,
+        method: Method,
+        path: &str,
+        body: Option<Bytes>,
+    ) -> Result<Response<Incoming>, TransportError> {
         let http_err = |message: String| TransportError::Http {
             address: address.clone(),
             message,
@@ -171,7 +269,7 @@ impl ClusterClient {
             .await
             .map_err(|err| http_err(format!("handshake: {err}")))?;
         tokio::spawn(async move {
-            // connection errors surface on `send_request` and the body read below
+            // connection errors surface on `send_request` and the body read
             let _ = conn.await;
         });
         let mut builder = Request::builder()
@@ -184,12 +282,19 @@ impl ClusterClient {
         let request = builder
             .body(Full::new(body.unwrap_or_default()))
             .map_err(|err| http_err(format!("build request: {err}")))?;
-        let response = sender
+        sender
             .send_request(request)
             .await
-            .map_err(|err| http_err(format!("send: {err}")))?;
-        let status = response.status();
-        let body = Limited::new(response.into_body(), self.max_body)
+            .map_err(|err| http_err(format!("send: {err}")))
+    }
+
+    /// The whole body of `response`, at most the client's body limit
+    async fn read_body(
+        &self,
+        address: &MachineAddress,
+        response: Response<Incoming>,
+    ) -> Result<Bytes, TransportError> {
+        Ok(Limited::new(response.into_body(), self.max_body)
             .collect()
             .await
             .map_err(|err| {
@@ -199,11 +304,13 @@ impl ClusterClient {
                         limit: self.max_body,
                     }
                 } else {
-                    http_err(format!("read body: {err}"))
+                    TransportError::Http {
+                        address: address.clone(),
+                        message: format!("read body: {err}"),
+                    }
                 }
             })?
-            .to_bytes();
-        Ok(ClusterResponse { status, body })
+            .to_bytes())
     }
 }
 

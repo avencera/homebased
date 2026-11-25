@@ -9,6 +9,7 @@
 //! confirms it is gone. See `docs/temporary-machines.md`
 
 pub mod boot;
+pub mod bundle;
 pub mod cloudlease;
 pub mod error;
 pub mod renewal;

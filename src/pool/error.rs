@@ -18,6 +18,12 @@ pub enum PoolCode {
     PoolDeadlineTooClose,
     /// A machine's join did not match a machine this coordinator asked for
     JoinRefused,
+    /// The coordinator could not fetch a pool job's commit from its remote
+    CommitUnavailable,
+    /// A pool job's commit has submodules, which no bundle carries
+    SubmodulesUnsupported,
+    /// A pool job's commit makes a bundle larger than a machine takes
+    BundleTooLarge,
 }
 
 impl PoolCode {
@@ -31,6 +37,9 @@ impl PoolCode {
             Self::PoolEnded => "pool_ended",
             Self::PoolDeadlineTooClose => "pool_deadline_too_close",
             Self::JoinRefused => "join_refused",
+            Self::CommitUnavailable => "commit_unavailable",
+            Self::SubmodulesUnsupported => "submodules_unsupported",
+            Self::BundleTooLarge => "bundle_too_large",
         }
     }
 
@@ -38,7 +47,11 @@ impl PoolCode {
     #[must_use]
     pub const fn exit_code(self) -> u8 {
         match self {
-            Self::PoolsNotConfigured | Self::PoolDeadlineTooClose => 2,
+            Self::PoolsNotConfigured
+            | Self::PoolDeadlineTooClose
+            | Self::CommitUnavailable
+            | Self::SubmodulesUnsupported
+            | Self::BundleTooLarge => 2,
             Self::PoolNotFound => 3,
             Self::PoolExists | Self::PoolEnded | Self::JoinRefused => 5,
         }

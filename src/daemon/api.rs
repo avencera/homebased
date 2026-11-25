@@ -103,6 +103,7 @@ pub fn socket_router(state: AppState) -> Router {
         .merge(crate::daemon::thread_detach::socket_routes())
         .merge(crate::daemon::service_api::socket_routes())
         .merge(crate::daemon::pools::socket_routes())
+        .merge(crate::daemon::bundles::socket_routes())
         .merge(crate::daemon::retention::routes())
         .with_state(state)
 }

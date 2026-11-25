@@ -75,15 +75,17 @@ pub(super) fn enrollment_routes() -> Router<AppState> {
 }
 
 /// What a joined temporary machine may call on its coordinator: join again,
-/// the Fleet probe, and event delivery for its own work; nothing that starts
-/// work, sends messages, or reads other machines' tasks
+/// the Fleet probe, event delivery for its own work, and the bundles of the
+/// jobs placed on it; nothing that starts work, sends messages, or reads
+/// other machines' tasks
 pub(super) fn member_routes(state: &AppState) -> Router<AppState> {
     let routes = enrollment_routes()
         .route(
             "/v1/cluster/job-events",
             post(super::queue_api::member_job_event),
         )
-        .route("/v1/cluster/events", post(super::cluster::member_event));
+        .route("/v1/cluster/events", post(super::cluster::member_event))
+        .route(super::bundles::MEMBER_ROUTE, super::bundles::member_route());
     let Some(fleet) = state.fleet.handle() else {
         return routes;
     };
@@ -374,9 +376,36 @@ pub(super) async fn admit_pool_job(state: &AppState, ci: &CiSpec) -> Result<bool
             if !reach.can_run(kill) {
                 return Err(out_of_reach(&pool, &reach, kill).into());
             }
+            // a machine has no git credentials, so the coordinator fetches the
+            // commit now; one it cannot fetch fails the job before any machine
+            // is asked for
+            super::bundles::prepare(state, ci).await?;
             Ok(true)
         }
     }
+}
+
+/// Make the bundle of a job pinned to `machine` when it is a machine of the
+/// pool its class names, so it reaches that machine with its commit; a
+/// regular Fleet machine fetches the commit itself
+pub(super) async fn prepare_pinned_pool_job(
+    state: &AppState,
+    ci: &CiSpec,
+    machine: crate::machine::MachineId,
+) -> Result<(), AppError> {
+    let pool = PoolName::from_class(ci.class.clone());
+    let machines = call(&state.store, |reply| StoreMsg::PoolMachines { pool, reply }).await?;
+    let member = machines.iter().any(|candidate| {
+        !matches!(candidate.state, MachineState::Released { .. })
+            && candidate
+                .state
+                .joined()
+                .is_some_and(|joined| joined.machine == machine)
+    });
+    if member {
+        super::bundles::prepare(state, ci).await?;
+    }
+    Ok(())
 }
 
 /// Why a job with kill limit `kill` can run on no machine of `pool`
@@ -606,6 +635,9 @@ pub(super) async fn run(state: AppState) {
             if let PoolState::Released { end, .. } = &pool.state {
                 if let Err(error) = pass.end_held_jobs(&pool, end).await {
                     warn!(pool = %name, "ending a released pool's held jobs: {error}");
+                }
+                if let Err(error) = super::bundles::remove_if_released(&state, &name).await {
+                    warn!(pool = %name, "removing a released pool's bundles: {error}");
                 }
                 continue;
             }
@@ -1246,6 +1278,8 @@ impl Pass<'_> {
         self.end_held_jobs(pool, &end).await?;
         if live.is_empty() && !run_open {
             info!(pool = %pool.name, "pool released");
+            // no job of the pool is left to need its bundles
+            super::bundles::remove(self.state, &pool.name);
             pool.state = PoolState::Released {
                 end,
                 at: Utc::now(),

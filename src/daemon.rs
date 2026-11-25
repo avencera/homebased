@@ -2,6 +2,7 @@
 
 pub mod actors;
 pub mod api;
+mod bundles;
 mod cancel_delivery;
 mod chains;
 mod child_requests;
@@ -143,6 +144,23 @@ pub(crate) struct DaemonLocks {
     pub(crate) cancellation_intents: KeyedLocks<TaskId>,
     /// Joins of temporary machines, by pool slot
     pub(crate) pool_joins: KeyedLocks<crate::pool::SlotId>,
+    /// A coordinator's bundle making, by pool, since a pool's mirror takes
+    /// one fetch at a time
+    pub(crate) pool_bundles: KeyedLocks<crate::pool::PoolName>,
+    /// A temporary machine's bundle downloads, by commit
+    pub(crate) bundle_fetches: KeyedLocks<crate::queue::ci::CommitId>,
+}
+
+/// Where slot clones get CI commits: a temporary machine has no git
+/// credentials, so it gets them from its coordinator's bundles through this
+/// executable
+fn commit_origin(temporary: bool) -> Result<crate::queue::ci::CommitOrigin, AppError> {
+    if !temporary {
+        return Ok(crate::queue::ci::CommitOrigin::Remote);
+    }
+    Ok(crate::queue::ci::CommitOrigin::Coordinator {
+        program: std::env::current_exe()?,
+    })
 }
 
 /// Hold `daemon.lock`, bind the socket and optional dashboard port, start
@@ -187,6 +205,7 @@ pub async fn serve(home: Home, web_listen: WebListen, config: Config) -> Result<
     .with_notifications(notifier.clone(), machine.name.to_string())
     .with_queue_thresholds(config.resource.notify_blocked_after)
     .with_ci(config.ci.clone())
+    .with_commits(commit_origin(config.temporary.is_some())?)
     .with_memory(memory_limits.clone());
     let (supervisor, handle) = SupervisorActor::spawn(None, SupervisorActor, supervisor_args)
         .await

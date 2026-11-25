@@ -1379,3 +1379,6 @@ fn an_idle_machine_stays_until_its_paid_time_ends_and_takes_a_job_meanwhile() {
     );
     assert!(asked - hold_until < chrono::Duration::seconds(10));
 }
+
+#[path = "pool_repos.rs"]
+mod repos;
