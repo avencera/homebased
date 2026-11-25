@@ -106,6 +106,19 @@ fn peak_task(h: &Harness, gate: &str, peak: f64) -> Value {
     spec
 }
 
+/// Whether the origin inbox settled event `seq` of task `id`, read from the store
+fn delivery_settled(h: &Harness, id: &str, seq: i64) -> bool {
+    let db = rusqlite::Connection::open(h.home.join(homebased::home::DB_NAME)).unwrap();
+    let settled_at: Option<String> = db
+        .query_row(
+            "SELECT settled_at FROM origin_inbox WHERE task_id=?1 AND seq=?2",
+            rusqlite::params![id, seq],
+            |row| row.get(0),
+        )
+        .unwrap();
+    settled_at.is_some()
+}
+
 fn eventually(what: &str, mut check: impl FnMut() -> bool) {
     assert!(wait_until(Duration::from_secs(20), &mut check), "{what}");
 }
@@ -645,7 +658,14 @@ fn a_running_task_whose_unused_peak_alone_keeps_a_task_waiting_gets_one_memory_r
     assert_eq!(task(&h, &holder)["status"], "running");
     assert_eq!(task(&h, &waiter)["status"], "held");
 
-    // asked once, also after a restart forgets the wait
+    // asked once, also after a restart forgets the wait. The queued message
+    // lands before its delivery settles, and a daemon killed in between sends
+    // the same event again, as at-least-once delivery allows, so the restart
+    // waits for the settle; any second line is then a second review
+    let seq = review["seq"].as_i64().unwrap();
+    eventually("the review's delivery never settled", || {
+        delivery_settled(&h, &holder, seq)
+    });
     with_memory_gate(&mut h, &cgroup, &review_in_a_second);
     std::thread::sleep(Duration::from_secs(4));
     assert_eq!(reviews(&h, &holder).len(), 1, "{:?}", reviews(&h, &holder));
