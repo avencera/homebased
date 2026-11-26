@@ -248,6 +248,8 @@ homebased task log <id> --tail 200
 homebased --json task cancel <id>
 ```
 
+`homebased status` summarizes this machine: whether the daemon is up, how many tasks are running, queued, and held, each GPU and the job it runs, how many GPU queue jobs are active and queued, and how many services are up. `homebased ls` (also `list` and `ps`) lists every held, queued, or running task, GPU queue job, and service, one row each; a GPU job's run task shows only as its job. Both read the local daemon, end with the commands that show each part in full, and take `--json`. A part the daemon could not give is reported in its place. A guessed top-level word such as `jobs`, `logs`, or `cancel` fails with a usage error that names the commands to run instead.
+
 `task show` and `task list` include `worker_thread`. A Claude task records its
 session id when it starts running. A Codex task records the thread from its
 session header when it ends, whether it succeeds, fails, is cancelled, or is

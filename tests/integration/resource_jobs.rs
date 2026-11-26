@@ -275,6 +275,24 @@ fn yield_callbacks_are_ordered_and_keep_each_thread() {
     assert_eq!(show(&h, low)["last_stop_cause"], "yield");
 }
 
+/// Agents that skip the skill guess words such as `jobs`; each answers with
+/// real commands instead of a bare usage error
+#[test]
+fn cli_guessed_commands_point_to_real_ones() {
+    let h = Harness::new();
+    let guess = h.cmd().args(["jobs"]).output().unwrap();
+    assert_eq!(guess.status.code(), Some(2));
+    let stderr = String::from_utf8(guess.stderr).unwrap();
+    assert!(
+        stderr.contains("unrecognized subcommand 'jobs'"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("Run one of these instead:\n  homebased queue"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn cli_queue_moves_replay_stored_results_and_cancel() {
     let h = Harness::new();
@@ -327,6 +345,48 @@ fn cli_queue_moves_replay_stored_results_and_cancel() {
     assert_eq!(order["jobs"][0]["id"], b.to_string());
     assert_eq!(order["jobs"][1]["id"], c.to_string());
     assert_eq!(order["jobs"][0]["target"]["type"], "pinned");
+    assert_eq!(cli(&h, &["queue"]), order);
+
+    // `ls` shows the running GPU job once, as a job on its resource
+    let listed = cli(&h, &["list"]);
+    let items = listed["items"].as_array().unwrap();
+    let row = |id: JobId| {
+        items
+            .iter()
+            .find(|item| item["id"] == id.to_string())
+            .unwrap_or_else(|| panic!("{id} missing from {listed}"))
+    };
+    assert_eq!(row(active)["kind"], "job");
+    assert_eq!(row(active)["state"], "active");
+    assert_eq!(row(active)["resource"], "gpu0");
+    assert_eq!(row(b)["state"], "queued");
+    assert!(
+        items.iter().all(|item| item["kind"] == "job"),
+        "a GPU run shows only as its job: {listed}"
+    );
+
+    let status = cli(&h, &["status"]);
+    assert_eq!(status["daemon"]["state"], "up");
+    assert_eq!(status["tasks"]["running"], 0);
+    let jobs = &status["jobs"];
+    assert_eq!(
+        jobs["active"].as_u64().unwrap() + jobs["queued"].as_u64().unwrap(),
+        items.len() as u64
+    );
+    let gpu0 = status["gpus"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|gpu| gpu["resource"] == "gpu0")
+        .unwrap();
+    assert_eq!(gpu0["job"], active.to_string());
+    assert!(
+        status["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|pointer| pointer["command"] == "homebased queue")
+    );
     let conflict = h
         .cmd()
         .args([

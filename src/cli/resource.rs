@@ -676,7 +676,7 @@ fn target_label(target: Target, known: &[Resource]) -> String {
 }
 
 /// `gpu0 (RTX 5090)` for a known resource, else its UUID
-fn resource_label(id: ResourceId, known: &[Resource]) -> String {
+pub(super) fn resource_label(id: ResourceId, known: &[Resource]) -> String {
     match known.iter().find(|resource| resource.id == id) {
         Some(Resource {
             name,

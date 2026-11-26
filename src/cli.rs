@@ -5,8 +5,10 @@ pub mod config;
 pub mod daemon;
 pub mod fleet;
 pub mod gc;
+pub mod guide;
 pub mod message;
 pub mod notify;
+pub mod overview;
 pub mod pool;
 pub mod resource;
 pub mod service;
@@ -124,6 +126,8 @@ pub enum Command {
         #[command(subcommand)]
         command: resource::ResourceCommand,
     },
+    /// Show the GPU queue in serving order, the same as `resource jobs`
+    Queue(resource::MachineArgs),
     /// Run long-lived processes, such as dev servers and emulators, that this thread starts and does not wait on
     ///
     /// A service runs under the daemon, detached from the caller's shell, in the
@@ -202,6 +206,15 @@ pub enum Command {
     Gc(gc::GcArgs),
     /// Replace this binary from GitHub and restart the daemon and dashboard
     Update(update::UpdateArgs),
+    /// Summarize this machine: the daemon, active tasks, each GPU and its job, the GPU queue, and services
+    ///
+    /// Ends with the commands that show each part in full
+    Status,
+    /// List every held, queued, or running task, GPU queue job, and service on this machine
+    ///
+    /// A GPU job's run task shows as its job. Ends with the commands that list each kind in full
+    #[command(alias = "list", alias = "ps")]
+    Ls,
     /// Print the version
     Version,
     /// Hidden worker parent of one agent
@@ -342,6 +355,7 @@ pub async fn run() -> ExitCode {
         Err(err) => {
             // clap already wrote its own message
             let _ = err.print();
+            guide::hint_unknown_command(&err, std::env::args_os());
             let code = u8::try_from(err.exit_code()).unwrap_or(2);
             return ExitCode::from(code);
         }
@@ -379,6 +393,9 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, AppError> {
         Command::Notify { command } => notify::run(&ctx, command).await,
         Command::Task { command } => task::run(&ctx, command).await,
         Command::Resource { command } => resource::run(&ctx, command).await,
+        Command::Queue(machine) => {
+            resource::run(&ctx, resource::ResourceCommand::Jobs(machine)).await
+        }
         Command::Ci { command } => ci::run(&ctx, command).await,
         Command::Service { command } => service::run(&ctx, command).await,
         Command::T3 { command } => t3::run(&ctx, command).await,
@@ -386,6 +403,8 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, AppError> {
         Command::Wait(args) => wait::wait(&ctx, args).await,
         Command::Gc(args) => gc::run(&ctx, args).await,
         Command::Update(args) => update::run(&ctx, args).await,
+        Command::Status => overview::status(&ctx).await,
+        Command::Ls => overview::list(&ctx).await,
         Command::Version => {
             version(&ctx)?;
             Ok(ExitCode::SUCCESS)
